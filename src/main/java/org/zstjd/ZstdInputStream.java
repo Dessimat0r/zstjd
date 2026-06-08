@@ -31,9 +31,9 @@ public class ZstdInputStream extends InputStream {
             if (bufPos >= bufLen) {
                 if (eof) return copied > 0 ? copied : -1;
                 byte[] newBuf = fillBuffer();
-                bufPos = 0;
                 if (newBuf == null) { eof = true; return copied > 0 ? copied : -1; }
                 buf = newBuf;
+                bufPos = 0;
                 bufLen = buf.length;
             }
             int avail = bufLen - bufPos;
