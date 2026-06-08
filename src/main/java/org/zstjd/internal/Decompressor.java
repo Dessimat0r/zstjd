@@ -28,7 +28,6 @@ public final class Decompressor {
             int bh = Constants.readLE24(src, pos); pos += 3;
             boolean last = (bh & 1) != 0;
             int type = (bh >> 1) & 3, bSize = (bh >> 3) & 0x1FFFFF;
-            if (bSize > end - pos) throw new IllegalArgumentException("Block too big");
             if (type == Constants.BLOCK_RAW) { grow(dstPos + bSize); System.arraycopy(src, pos, dst, dstPos, bSize); dstPos += bSize; pos += bSize; }
             else if (type == Constants.BLOCK_RLE) { byte v = src[pos++]; grow(dstPos + bSize); Arrays.fill(dst, dstPos, dstPos + bSize, v); dstPos += bSize; }
             else if (type == Constants.BLOCK_COMPRESSED) { pos += decodeCompressed(src, pos, bSize); }
@@ -47,9 +46,8 @@ public final class Decompressor {
             int wLog = (wl >> 3) + Constants.WINDOW_LOG_MIN + (wl & 7);
             int win = (int) Math.min(1L << Math.min(wLog, Constants.WINDOW_LOG_MAX), 1 << 25);
             if (dst.length < win) dst = new byte[win];
-        } else {
-            if (dst.length < 1 << 20) dst = new byte[1 << 20];
         }
+        if (dst.length < 1 << 20) dst = new byte[1 << 20];
         if (fcsId == 1) pos += 2;
         else if (fcsId == 2) pos += 4;
         else if (fcsId == 3) pos += 8;
@@ -60,25 +58,34 @@ public final class Decompressor {
 
     private int decodeCompressed(byte[] src, int pos, int size) {
         int start = pos;
-        pos = decodeLiterals(src, pos);
-        int remaining = size - (pos - start);
-        if (remaining > 0) pos += decodeSequences(src, pos, remaining);
-        return pos - start;
-    }
-
-    private int decodeLiterals(byte[] src, int pos) {
+        // Decode literals into temporary buffer
+        byte[] literals = new byte[Constants.BLOCK_SIZE_MAX];
+        int litLen = 0;
         int h = src[pos++] & 0xFF;
-        int type = (h >> 2) & 3, regen = h >> 3, s1, rawSize;
+        int type = (h >> 2) & 3, regen = h >> 3, s1, rawSize = 0;
         if (regen < 32) { s1 = src[pos++] & 0xFF; regen = (regen << 4) | (s1 >> 4); rawSize = s1 & 0xF; }
         else if (regen < 4096) { s1 = Constants.readLE16(src, pos); pos += 2; regen = (regen << 4) | (s1 >> 4); rawSize = s1 & 0xF; }
         else { s1 = Constants.readLE32(src, pos) & 0xFFFFFF; pos += 3; regen = (regen << 4) | (s1 >> 4); rawSize = (s1 >> 4) & 0xFFFFF; }
-        if (type == Constants.LITERALS_RAW) { grow(dstPos + rawSize); System.arraycopy(src, pos, dst, dstPos, rawSize); dstPos += rawSize; return pos + rawSize; }
-        if (type == Constants.LITERALS_RLE) { byte v = src[pos++]; grow(dstPos + regen); Arrays.fill(dst, dstPos, dstPos + regen, v); dstPos += regen; return pos; }
-        return pos; // skip compressed literals for now, just advance past header
+
+        if (type == Constants.LITERALS_RAW) {
+            litLen = regen;
+            System.arraycopy(src, pos, literals, 0, regen);
+            pos += regen;
+        } else if (type == Constants.LITERALS_RLE) {
+            litLen = regen;
+            byte v = src[pos++];
+            Arrays.fill(literals, 0, litLen, v);
+        } else {
+            return size; // skip unsupported literals
+        }
+
+        if (pos - start >= size) return size;
+        int remaining = size - (pos - start);
+        if (remaining > 0) pos += decodeSequences(src, pos, remaining, literals, litLen);
+        return pos - start;
     }
 
-    private int decodeSequences(byte[] src, int pos, int max) {
-        if (max < 1) return 0;
+    private int decodeSequences(byte[] src, int pos, int max, byte[] literals, int litTotal) {
         int consumed = 0;
         int h = src[pos] & 0xFF; consumed++;
         int seqCount;
@@ -103,12 +110,11 @@ public final class Decompressor {
         long bitOff = streamSize * 8L - padding;
         int base = pos + consumed;
 
-        // Read initial states
         bitOff -= llTable.accuracyLog; int llSt = (int)readBits(src, base, bitOff, llTable.accuracyLog);
         bitOff -= ofTable.accuracyLog; int ofSt = (int)readBits(src, base, bitOff, ofTable.accuracyLog);
         bitOff -= mlTable.accuracyLog; int mlSt = (int)readBits(src, base, bitOff, mlTable.accuracyLog);
 
-        // Decode and execute sequences
+        int litIdx = 0;
         for (int i = 0; i < seqCount && bitOff >= 0; i++) {
             int llCode = llTable.symbol[llSt] & 0xFFFF;
             int ofCode = ofTable.symbol[ofSt] & 0xFFFF;
@@ -122,9 +128,20 @@ public final class Decompressor {
             bitOff -= mlBits; long mlVal = readBits(src, base, bitOff, mlBits);
             bitOff -= llBits; long llVal = readBits(src, base, bitOff, llBits);
 
-            int offset = resolveOffset(Constants.OFFSET_BASE[ofCode] + (int)ofVal, llCode == 0 ? 1 : 0, i);
-
+            int litLen = Constants.LITLEN_BASE[llCode] + (int)llVal;
             int matchLen = Constants.MATCHLEN_BASE[mlCode] + (int)mlVal;
+            int offset = Constants.OFFSET_BASE[ofCode] + (int)ofVal;
+            offset = resolveOffset(offset, litLen, i);
+
+            // Copy literals
+            if (litLen > 0 && litIdx + litLen <= litTotal) {
+                grow(dstPos + litLen);
+                System.arraycopy(literals, litIdx, dst, dstPos, litLen);
+                dstPos += litLen;
+                litIdx += litLen;
+            }
+
+            // Copy match
             if (matchLen > 0 && offset <= dstPos) {
                 int sOff = dstPos - offset;
                 grow(dstPos + matchLen);
@@ -158,10 +175,10 @@ public final class Decompressor {
         return FseTable.fromDist(dist, acc, max);
     }
 
-    private int resolveOffset(int offset, int litLenZero, int seqIdx) {
+    private int resolveOffset(int offset, int litLen, int seqIdx) {
         if (offset <= 3) {
             int idx = offset - 1;
-            if (seqIdx > 0 && litLenZero > 0) idx++;
+            if (seqIdx > 0 && litLen == 0) idx++;
             if (idx == 0) return (int)prevOff[0];
             long v = idx < 3 ? prevOff[idx] : prevOff[0] - 1;
             if (idx > 1) prevOff[2] = prevOff[1];
