@@ -5,53 +5,64 @@ import java.util.Arrays;
 public final class Compressor {
     private int level;
     private byte[] dst;
+    private int dstPos;
 
-    public Compressor(int level) {
-        this.level = Math.max(Constants.MIN_LEVEL, Math.min(Constants.MAX_LEVEL, level));
-    }
-
-    public void reset(int level) {
-        this.level = level;
-    }
+    public Compressor(int level) { this.level = level; }
+    public void reset(int level) { this.level = level; }
 
     public byte[] compress(byte[] src) {
         long maxOut = Constants.compressBound(src.length);
         if (maxOut <= 0) maxOut = src.length + 64;
         dst = new byte[(int) Math.min(maxOut, Integer.MAX_VALUE - 8)];
-        int pos = 0;
-        pos = writeFrameHeader(pos);
-        int srcPos = 0;
-        while (srcPos < src.length) {
-            int chunk = Math.min(src.length - srcPos, Constants.BLOCK_SIZE_MAX);
-            boolean last = (srcPos + chunk >= src.length);
-            boolean allSame = chunk > 1;
-            if (allSame) {
-                byte first = src[srcPos];
-                for (int i = 1; i < chunk; i++) {
-                    if (src[srcPos + i] != first) { allSame = false; break; }
-                }
-            }
-            if (allSame) {
-                int raw = (last ? 1 : 0) | (Constants.BLOCK_RLE << 1) | (chunk << 3);
-                Constants.writeLE24(dst, pos, raw); pos += 3;
-                dst[pos++] = src[srcPos];
-            } else {
-                int raw = (last ? 1 : 0) | (Constants.BLOCK_RAW << 1) | (chunk << 3);
-                Constants.writeLE24(dst, pos, raw); pos += 3;
-                System.arraycopy(src, srcPos, dst, pos, chunk);
-                pos += chunk;
-            }
-            srcPos += chunk;
-        }
-        return Arrays.copyOf(dst, pos);
+        dstPos = 0;
+        writeFrameHeader();
+        writeBlocks(src);
+        return Arrays.copyOf(dst, dstPos);
     }
 
-    private int writeFrameHeader(int pos) {
-        Constants.writeLE32(dst, pos, Constants.ZSTD_MAGIC); pos += 4;
-        dst[pos++] = 0; // descriptor: no checksum, no dict, no content size, multi-segment
-        int wLog = 17 + Math.min(8, level / 3);
-        wLog = Math.max(wLog, Constants.WINDOW_LOG_MIN);
-        dst[pos++] = (byte) (((wLog - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
-        return pos;
+    private void writeFrameHeader() {
+        Constants.writeLE32(dst, dstPos, Constants.ZSTD_MAGIC); dstPos += 4;
+        dst[dstPos++] = 0;
+        int wl = Math.max(17 + Math.min(8, level / 3), Constants.WINDOW_LOG_MIN);
+        dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
+    }
+
+    private void ensure(int needed) {
+        if (dstPos + needed > dst.length)
+            dst = Arrays.copyOf(dst, Math.max(dst.length * 2, dstPos + needed));
+    }
+
+    private void writeBlocks(byte[] src) {
+        int srcPos = 0, remaining = src.length;
+        while (remaining > 0) {
+            int chunk = Math.min(remaining, Constants.BLOCK_SIZE_MAX);
+            boolean last = (remaining == chunk);
+            int blockSize = writeBestBlock(src, srcPos, chunk, last);
+            srcPos += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    private int writeBestBlock(byte[] src, int srcPos, int size, boolean last) {
+        // Check RLE
+        if (size > 0) {
+            boolean allSame = true;
+            for (int i = 1; i < size && allSame; i++)
+                if (src[srcPos + i] != src[srcPos]) allSame = false;
+            if (allSame) {
+                ensure(7);
+                int hdr = (last ? 1 : 0) | (Constants.BLOCK_RLE << 1) | (size << 3);
+                Constants.writeLE24(dst, dstPos, hdr); dstPos += 3;
+                dst[dstPos++] = src[srcPos];
+                return size;
+            }
+        }
+        // Raw block
+        ensure(3 + size);
+        int hdr = (last ? 1 : 0) | (Constants.BLOCK_RAW << 1) | (size << 3);
+        Constants.writeLE24(dst, dstPos, hdr); dstPos += 3;
+        System.arraycopy(src, srcPos, dst, dstPos, size);
+        dstPos += size;
+        return size;
     }
 }

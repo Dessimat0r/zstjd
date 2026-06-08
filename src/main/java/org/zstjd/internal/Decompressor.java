@@ -5,146 +5,203 @@ import java.util.Arrays;
 public final class Decompressor {
     private byte[] dst;
     private int dstPos;
+    private FseTable llTable, ofTable, mlTable;
+    private long[] prevOff = {1, 4, 8};
 
-    public Decompressor() {
-        dst = new byte[4096];
-    }
+    private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
+    private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
+    private static final int[] ML_DIST = {1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
 
-    public void reset() {
-        dstPos = 0;
-    }
+    public Decompressor() { dst = new byte[4096]; }
+    public void reset() { dstPos = 0; prevOff = new long[]{1, 4, 8}; llTable = null; ofTable = null; mlTable = null; }
 
-    public byte[] decompress(byte[] src) {
-        return decompress(src, 0, src.length);
-    }
+    public byte[] decompress(byte[] src) { return decompress(src, 0, src.length); }
 
     public byte[] decompress(byte[] src, int off, int len) {
         dstPos = 0;
-        int pos = off;
-        int end = off + len;
-        int magic = Constants.readLE32(src, pos); pos += 4;
-        if (magic != Constants.ZSTD_MAGIC)
-            throw new IllegalArgumentException("Bad magic: 0x" + Integer.toHexString(magic));
-        pos = parseFrameHeader(src, pos);
+        int pos = off, end = off + len;
+        if (Constants.readLE32(src, pos) != Constants.ZSTD_MAGIC)
+            throw new IllegalArgumentException("Bad magic");
+        pos += 4;
+        pos = parseFrameHeader(src, pos, end);
         while (pos + 3 <= end) {
             int bh = Constants.readLE24(src, pos); pos += 3;
             boolean last = (bh & 1) != 0;
-            int type = (bh >> 1) & 3;
-            int bSize = (bh >> 3) & 0x1FFFFF;
-            if (bSize > off + len - pos) throw new IllegalArgumentException("Block too big");
-            if (type == Constants.BLOCK_RAW) {
-                grow(dstPos + bSize);
-                System.arraycopy(src, pos, dst, dstPos, bSize);
-                dstPos += bSize; pos += bSize;
-            } else if (type == Constants.BLOCK_RLE) {
-                byte val = src[pos]; pos++;
-                grow(dstPos + bSize);
-                Arrays.fill(dst, dstPos, dstPos + bSize, val);
-                dstPos += bSize;
-            } else if (type == Constants.BLOCK_COMPRESSED) {
-                pos += parseCompressedBlock(src, pos, bSize);
-            } else throw new IllegalArgumentException("Bad block type: " + type);
+            int type = (bh >> 1) & 3, bSize = (bh >> 3) & 0x1FFFFF;
+            if (bSize > end - pos) throw new IllegalArgumentException("Block too big");
+            if (type == Constants.BLOCK_RAW) { grow(dstPos + bSize); System.arraycopy(src, pos, dst, dstPos, bSize); dstPos += bSize; pos += bSize; }
+            else if (type == Constants.BLOCK_RLE) { byte v = src[pos++]; grow(dstPos + bSize); Arrays.fill(dst, dstPos, dstPos + bSize, v); dstPos += bSize; }
+            else if (type == Constants.BLOCK_COMPRESSED) { pos += decodeCompressed(src, pos, bSize); }
+            else throw new IllegalArgumentException("Bad block type");
             if (last) break;
         }
         return Arrays.copyOf(dst, dstPos);
     }
 
-    private int parseFrameHeader(byte[] src, int pos) {
-        int fhd = src[pos] & 0xFF; pos++;
+    private int parseFrameHeader(byte[] src, int pos, int end) {
+        int fhd = src[pos++] & 0xFF;
         int fcsId = (fhd >> 6) & 3;
         boolean single = ((fhd >> 5) & 1) != 0;
-        int dictIdFlag = fhd & 3;
         if (!single) {
-            int wlByte = src[pos] & 0xFF; pos++;
-            long windowLog = (wlByte >> 3) + Constants.WINDOW_LOG_MIN + (wlByte & 7);
-            int winSize = (int) Math.min(1L << Math.min(windowLog, Constants.WINDOW_LOG_MAX), 1 << 25);
-            if (dst.length < winSize) dst = new byte[winSize];
+            int wl = src[pos++] & 0xFF;
+            int wLog = (wl >> 3) + Constants.WINDOW_LOG_MIN + (wl & 7);
+            int win = (int) Math.min(1L << Math.min(wLog, Constants.WINDOW_LOG_MAX), 1 << 25);
+            if (dst.length < win) dst = new byte[win];
+        } else {
+            if (dst.length < 1 << 20) dst = new byte[1 << 20];
         }
-        if (fcsId == 1) { pos += 2; }
-        else if (fcsId == 2) { pos += 4; }
-        else if (fcsId == 3) { pos += 8; }
-        if (dictIdFlag > 0) { pos += 1 << dictIdFlag; }
+        if (fcsId == 1) pos += 2;
+        else if (fcsId == 2) pos += 4;
+        else if (fcsId == 3) pos += 8;
+        int dict = fhd & 3;
+        if (dict > 0) pos += 1 << dict;
         return pos;
     }
 
-    private int parseCompressedBlock(byte[] src, int pos, int bSize) {
+    private int decodeCompressed(byte[] src, int pos, int size) {
         int start = pos;
-        int lt = (src[pos] >> 2) & 3;
-        int hdr = src[pos] & 0xFF; pos++;
-        int regen = hdr >> 3;
-        int stream1;
-        if (regen < 32) {
-            stream1 = src[pos] & 0xFF; pos++;
-            regen = (regen << 4) | (stream1 >> 4);
-            if (lt == Constants.LITERALS_RAW) {
-                int rawSize = stream1 & 0xF;
-                grow(dstPos + rawSize);
-                System.arraycopy(src, pos, dst, dstPos, rawSize);
-                dstPos += rawSize; pos += rawSize;
-                return pos - start;
+        pos = decodeLiterals(src, pos);
+        int remaining = size - (pos - start);
+        if (remaining > 0) pos += decodeSequences(src, pos, remaining);
+        return pos - start;
+    }
+
+    private int decodeLiterals(byte[] src, int pos) {
+        int h = src[pos++] & 0xFF;
+        int type = (h >> 2) & 3, regen = h >> 3, s1, rawSize;
+        if (regen < 32) { s1 = src[pos++] & 0xFF; regen = (regen << 4) | (s1 >> 4); rawSize = s1 & 0xF; }
+        else if (regen < 4096) { s1 = Constants.readLE16(src, pos); pos += 2; regen = (regen << 4) | (s1 >> 4); rawSize = s1 & 0xF; }
+        else { s1 = Constants.readLE32(src, pos) & 0xFFFFFF; pos += 3; regen = (regen << 4) | (s1 >> 4); rawSize = (s1 >> 4) & 0xFFFFF; }
+        if (type == Constants.LITERALS_RAW) { grow(dstPos + rawSize); System.arraycopy(src, pos, dst, dstPos, rawSize); dstPos += rawSize; return pos + rawSize; }
+        if (type == Constants.LITERALS_RLE) { byte v = src[pos++]; grow(dstPos + regen); Arrays.fill(dst, dstPos, dstPos + regen, v); dstPos += regen; return pos; }
+        return pos; // skip compressed literals for now, just advance past header
+    }
+
+    private int decodeSequences(byte[] src, int pos, int max) {
+        if (max < 1) return 0;
+        int consumed = 0;
+        int h = src[pos] & 0xFF; consumed++;
+        int seqCount;
+        if (h < 128) seqCount = h;
+        else if (h < 255) { seqCount = ((h-128) << 8) | (src[pos+1] & 0xFF); consumed++; }
+        else { seqCount = Constants.readLE16(src, pos+1) + 0x7F00; consumed += 2; }
+        if (seqCount == 0) return consumed;
+        int modes = src[pos + consumed] & 0xFF; consumed++;
+        int llM = (modes >> 6) & 3, ofM = (modes >> 4) & 3, mlM = (modes >> 2) & 3;
+
+        ForwardReader fr = new ForwardReader(src, pos + consumed);
+        llTable = readSeqTable(fr, llM, llTable, LL_DIST, 6, 35);
+        ofTable = readSeqTable(fr, ofM, ofTable, OF_DIST, 5, 28);
+        mlTable = readSeqTable(fr, mlM, mlTable, ML_DIST, 6, 52);
+        int fwdBytes = fr.bytePos(); fr.align();
+        consumed += fwdBytes;
+
+        int streamSize = max - consumed;
+        if (streamSize <= 0) return max;
+        int lastByte = src[pos + consumed + streamSize - 1] & 0xFF;
+        int padding = lastByte == 0 ? 8 : 8 - (31 - Integer.numberOfLeadingZeros(lastByte));
+        long bitOff = streamSize * 8L - padding;
+        int base = pos + consumed;
+
+        // Read initial states
+        bitOff -= llTable.accuracyLog; int llSt = (int)readBits(src, base, bitOff, llTable.accuracyLog);
+        bitOff -= ofTable.accuracyLog; int ofSt = (int)readBits(src, base, bitOff, ofTable.accuracyLog);
+        bitOff -= mlTable.accuracyLog; int mlSt = (int)readBits(src, base, bitOff, mlTable.accuracyLog);
+
+        // Decode and execute sequences
+        for (int i = 0; i < seqCount && bitOff >= 0; i++) {
+            int llCode = llTable.symbol[llSt] & 0xFFFF;
+            int ofCode = ofTable.symbol[ofSt] & 0xFFFF;
+            int mlCode = mlTable.symbol[mlSt] & 0xFFFF;
+
+            int ofBits = Constants.OFFSET_BITS[Math.min(ofCode, 31)];
+            int mlBits = Constants.MATCHLEN_BITS[Math.min(mlCode, 52)];
+            int llBits = Constants.LITLEN_BITS[Math.min(llCode, 35)];
+
+            bitOff -= ofBits; long ofVal = readBits(src, base, bitOff, ofBits);
+            bitOff -= mlBits; long mlVal = readBits(src, base, bitOff, mlBits);
+            bitOff -= llBits; long llVal = readBits(src, base, bitOff, llBits);
+
+            int offset = resolveOffset(Constants.OFFSET_BASE[ofCode] + (int)ofVal, llCode == 0 ? 1 : 0, i);
+
+            int matchLen = Constants.MATCHLEN_BASE[mlCode] + (int)mlVal;
+            if (matchLen > 0 && offset <= dstPos) {
+                int sOff = dstPos - offset;
+                grow(dstPos + matchLen);
+                if (offset >= matchLen) System.arraycopy(dst, sOff, dst, dstPos, matchLen);
+                else for (int j = 0; j < matchLen; j++) dst[dstPos + j] = dst[sOff + j];
+                dstPos += matchLen;
             }
-        } else if (regen < 4096) {
-            stream1 = Constants.readLE16(src, pos); pos += 2;
-            regen = (regen << 4) | (stream1 >> 4);
-            if (lt == Constants.LITERALS_RAW) {
-                int rawSize = stream1 & 0xF;
-                grow(dstPos + rawSize);
-                System.arraycopy(src, pos, dst, dstPos, rawSize);
-                dstPos += rawSize; pos += rawSize;
-                return pos - start;
-            }
-        } else {
-            stream1 = Constants.readLE32(src, pos) & 0xFFFFFF; pos += 3;
-            regen = (regen << 4) | (stream1 >> 4);
-            if (lt == Constants.LITERALS_RAW) {
-                int rawSize = (stream1 >> 4) & 0xFFFFF;
-                grow(dstPos + rawSize);
-                System.arraycopy(src, pos, dst, dstPos, rawSize);
-                dstPos += rawSize; pos += rawSize;
-                return pos - start;
+
+            if (i < seqCount - 1) {
+                int llNb = llTable.numBits[llSt] & 0xFF;
+                bitOff -= llNb; long llNext = readBits(src, base, bitOff, llNb);
+                llSt = (llTable.newState[llSt] & 0xFFFF) + (int)llNext;
+
+                int mlNb = mlTable.numBits[mlSt] & 0xFF;
+                bitOff -= mlNb; long mlNext = readBits(src, base, bitOff, mlNb);
+                mlSt = (mlTable.newState[mlSt] & 0xFFFF) + (int)mlNext;
+
+                int ofNb = ofTable.numBits[ofSt] & 0xFF;
+                bitOff -= ofNb; long ofNext = readBits(src, base, bitOff, ofNb);
+                ofSt = (ofTable.newState[ofSt] & 0xFFFF) + (int)ofNext;
             }
         }
-        if (lt == Constants.LITERALS_RLE) {
-            byte val = src[pos]; pos++;
-            grow(dstPos + regen);
-            Arrays.fill(dst, dstPos, dstPos + regen, val);
-            dstPos += regen;
-            return pos - start;
+        return consumed + streamSize;
+    }
+
+    private FseTable readSeqTable(ForwardReader fr, int mode, FseTable prev, int[] dist, int acc, int max) {
+        if (mode == 0) return FseTable.fromDist(dist, acc, max);
+        if (mode == 1) { int s = fr.read(8); return FseTable.fromDist(new int[]{-1}, 1, 0); }
+        if (mode == 2) return FseTable.readFrom(fr, max);
+        if (prev != null) return prev;
+        return FseTable.fromDist(dist, acc, max);
+    }
+
+    private int resolveOffset(int offset, int litLenZero, int seqIdx) {
+        if (offset <= 3) {
+            int idx = offset - 1;
+            if (seqIdx > 0 && litLenZero > 0) idx++;
+            if (idx == 0) return (int)prevOff[0];
+            long v = idx < 3 ? prevOff[idx] : prevOff[0] - 1;
+            if (idx > 1) prevOff[2] = prevOff[1];
+            prevOff[1] = prevOff[0]; prevOff[0] = v;
+            return (int)v;
         }
-        return bSize; // Skip compressed blocks for now
+        long v = offset - 3;
+        prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = v;
+        return (int)v;
+    }
+
+    private long readBits(byte[] src, int base, long bitOff, int n) {
+        if (n <= 0) return 0;
+        long val = 0;
+        for (int i = 0; i < n; i++) {
+            long p = bitOff + i;
+            if (p < 0) { val = (val << 1); continue; }
+            int bi = (int)(p / 8);
+            if (bi >= src.length - base) { val = (val << 1); continue; }
+            val = (val << 1) | ((src[base + bi] >> ((int)(p % 8))) & 1);
+        }
+        return val;
     }
 
     public static int getContentSize(byte[] data) {
         if (data.length < 8) return Constants.CONTENTSIZE_ERROR;
-        int magic = Constants.readLE32(data, 0);
-        if (magic != Constants.ZSTD_MAGIC) return Constants.CONTENTSIZE_ERROR;
+        if (Constants.readLE32(data, 0) != Constants.ZSTD_MAGIC) return Constants.CONTENTSIZE_ERROR;
         int fhd = data[4] & 0xFF;
         int fcsId = (fhd >> 6) & 3;
         boolean single = ((fhd >> 5) & 1) != 0;
         int skip = 5;
         if (!single) skip++;
-        if (fcsId == 1) {
-            if (data.length < skip + 2) return Constants.CONTENTSIZE_UNKNOWN;
-            return (Constants.readLE16(data, skip) & 0xFFFF) + 256;
-        }
-        if (fcsId == 2) {
-            if (data.length < skip + 4) return Constants.CONTENTSIZE_UNKNOWN;
-            return Constants.readLE32(data, skip);
-        }
-        if (fcsId == 3) {
-            if (data.length < skip + 8) return Constants.CONTENTSIZE_UNKNOWN;
-            return (int) Constants.readLE64(data, skip);
-        }
-        if (single && data.length > skip) {
-            return data[skip] & 0xFF;
-        }
+        if (fcsId == 1) return data.length >= skip + 2 ? (Constants.readLE16(data, skip) & 0xFFFF) + 256 : Constants.CONTENTSIZE_UNKNOWN;
+        if (fcsId == 2) return data.length >= skip + 4 ? Constants.readLE32(data, skip) : Constants.CONTENTSIZE_UNKNOWN;
+        if (fcsId == 3) return data.length >= skip + 8 ? (int) Constants.readLE64(data, skip) : Constants.CONTENTSIZE_UNKNOWN;
+        if (single) return data.length > skip ? data[skip] & 0xFF : Constants.CONTENTSIZE_UNKNOWN;
         return Constants.CONTENTSIZE_UNKNOWN;
     }
 
-    private void grow(int needed) {
-        if (needed > dst.length) {
-            int n = Math.max(needed, Math.max(dst.length * 2, 1 << 20));
-            dst = Arrays.copyOf(dst, n);
-        }
+    private void grow(int n) {
+        if (n > dst.length) dst = Arrays.copyOf(dst, Math.max(n, Math.max(dst.length * 2, 1 << 20)));
     }
 }
