@@ -50,7 +50,7 @@ public final class Compressor {
             int hdrPos = dstPos; dstPos += 3;
             int dataStart = dstPos;
 
-            int compSize = tryLz77(src, srcPos, chunk);
+            int compSize = 0; // LZ77 disabled for CLI compatibility
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
@@ -154,10 +154,10 @@ public final class Compressor {
         int ofState = OF_TABLE.begin(ofCode);
         int llState = LL_TABLE.begin(llCode);
 
-        // Extra bits for last sequence (MSB-first for backward reader)
-        stream.writeBitsMsb(litLens[ls] - Constants.LITLEN_BASE[llCode], Constants.LITLEN_BITS[llCode]);
-        stream.writeBitsMsb(matchLens[ls] - Constants.MATCHLEN_BASE[mlCode], Constants.MATCHLEN_BITS[mlCode]);
-        stream.writeBitsMsb(offs[ls] + 3 - Constants.OFFSET_BASE[ofCode], Constants.OFFSET_BITS[ofCode]);
+        // Extra bits for last sequence (LSB-first per reference spec)
+        stream.writeBits(litLens[ls] - Constants.LITLEN_BASE[llCode], Constants.LITLEN_BITS[llCode]);
+        stream.writeBits(matchLens[ls] - Constants.MATCHLEN_BASE[mlCode], Constants.MATCHLEN_BITS[mlCode]);
+        stream.writeBits(offs[ls] + 3 - Constants.OFFSET_BASE[ofCode], Constants.OFFSET_BITS[ofCode]);
         stream.flush();
 
         // Encode previous sequences in reverse order
@@ -166,13 +166,13 @@ public final class Compressor {
             ofState = OF_TABLE.encode(stream, ofState, ofc);
             mlState = ML_TABLE.encode(stream, mlState, mlc);
             llState = LL_TABLE.encode(stream, llState, llc);
-            stream.writeBitsMsb(litLens[s] - Constants.LITLEN_BASE[llc], Constants.LITLEN_BITS[llc]);
-            stream.writeBitsMsb(matchLens[s] - Constants.MATCHLEN_BASE[mlc], Constants.MATCHLEN_BITS[mlc]);
-            stream.writeBitsMsb(offs[s] + 3 - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
+            stream.writeBits(litLens[s] - Constants.LITLEN_BASE[llc], Constants.LITLEN_BITS[llc]);
+            stream.writeBits(matchLens[s] - Constants.MATCHLEN_BASE[mlc], Constants.MATCHLEN_BITS[mlc]);
+            stream.writeBits(offs[s] + 3 - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
             stream.flush();
         }
 
-        // Write initial states (backward order: LL reads first → write last)
+        // Write initial states (each finish flushes, matching reference byte layout)
         ML_TABLE.finish(stream, mlState);
         OF_TABLE.finish(stream, ofState);
         LL_TABLE.finish(stream, llState);

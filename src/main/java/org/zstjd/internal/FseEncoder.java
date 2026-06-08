@@ -20,7 +20,7 @@ public final class FseEncoder {
                 int base = table.newState[s] & 0xFFFF;
                 int bitsVal = state - base;
                 if (bitsVal >= 0 && bitsVal < (1 << nBits)) {
-                    stream.writeBitsMsb(bitsVal, nBits);
+                    stream.writeBits(bitsVal, nBits);
                     return s;
                 }
             }
@@ -44,11 +44,12 @@ public final class FseEncoder {
         int nb = table.numBits[bestS] & 0xFF;
         int bs = table.newState[bestS] & 0xFFFF;
         int clamped = Math.max(0, Math.min(state - bs, (1 << nb) - 1));
-        stream.writeBitsMsb(clamped, nb);
+        stream.writeBits(clamped, nb);
         return bestS;
     }
 
     public void finish(BitStream stream, int state) {
-        stream.writeBitsMsb(state, table.accuracyLog);
+        stream.writeBits(state, table.accuracyLog);
+        stream.flush();
     }
 }

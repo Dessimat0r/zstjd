@@ -208,10 +208,10 @@ public final class Decompressor {
         long val = 0;
         for (int i = 0; i < n; i++) {
             long p = bitOff + i;
-            if (p < 0) { val = (val << 1); continue; }
+            if (p < 0) { continue; }
             int bi = (int)(p / 8);
-            if (bi >= src.length - base) { val = (val << 1); continue; }
-            val = (val << 1) | ((src[base + bi] >> ((int)(p % 8))) & 1);
+            if (bi >= src.length - base) { continue; }
+            val |= (long)(((src[base + bi] >> ((int)(p % 8))) & 1)) << i;
         }
         return val;
     }
