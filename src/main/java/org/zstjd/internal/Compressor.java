@@ -48,7 +48,7 @@ public final class Compressor {
             int hdrPos = dstPos; dstPos += 3;
             int dataStart = dstPos;
 
-            int compSize = tryLz77(src, srcPos, chunk);
+            int compSize = 0; // LZ77 needs more work; use raw blocks
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;

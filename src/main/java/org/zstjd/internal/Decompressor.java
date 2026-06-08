@@ -20,19 +20,23 @@ public final class Decompressor {
     public byte[] decompress(byte[] src, int off, int len) {
         dstPos = 0;
         int pos = off, end = off + len;
-        if (Constants.readLE32(src, pos) != Constants.ZSTD_MAGIC)
-            throw new IllegalArgumentException("Bad magic");
-        pos += 4;
-        pos = parseFrameHeader(src, pos, end);
-        while (pos + 3 <= end) {
-            int bh = Constants.readLE24(src, pos); pos += 3;
-            boolean last = (bh & 1) != 0;
-            int type = (bh >> 1) & 3, bSize = (bh >> 3) & 0x1FFFFF;
-            if (type == Constants.BLOCK_RAW) { grow(dstPos + bSize); System.arraycopy(src, pos, dst, dstPos, bSize); dstPos += bSize; pos += bSize; }
-            else if (type == Constants.BLOCK_RLE) { byte v = src[pos++]; grow(dstPos + bSize); Arrays.fill(dst, dstPos, dstPos + bSize, v); dstPos += bSize; }
-            else if (type == Constants.BLOCK_COMPRESSED) { pos += decodeCompressed(src, pos, bSize); }
-            else throw new IllegalArgumentException("Bad block type");
-            if (last) break;
+        while (pos + 4 <= end) {
+            int magic = Constants.readLE32(src, pos);
+            if (magic != Constants.ZSTD_MAGIC) break;
+            pos += 4;
+            boolean hasChecksum = ((src[pos] >> 2) & 1) != 0;
+            pos = parseFrameHeader(src, pos, end);
+            while (pos + 3 <= end) {
+                int bh = Constants.readLE24(src, pos); pos += 3;
+                boolean last = (bh & 1) != 0;
+                int type = (bh >> 1) & 3, bSize = (bh >> 3) & 0x1FFFFF;
+                if (type == Constants.BLOCK_RAW) { grow(dstPos + bSize); System.arraycopy(src, pos, dst, dstPos, bSize); dstPos += bSize; pos += bSize; }
+                else if (type == Constants.BLOCK_RLE) { byte v = src[pos++]; grow(dstPos + bSize); Arrays.fill(dst, dstPos, dstPos + bSize, v); dstPos += bSize; }
+                else if (type == Constants.BLOCK_COMPRESSED) { pos += decodeCompressed(src, pos, bSize); }
+                else throw new IllegalArgumentException("Bad block type");
+                if (last) break;
+            }
+            if (hasChecksum && pos + 4 <= end) { pos += 4; }
         }
         return Arrays.copyOf(dst, dstPos);
     }
