@@ -2,6 +2,7 @@
   "$schema": "https://opencode.ai/config.json",
   "lsp": {
     "java": {
+      "command": ["jdtls"],
       "extensions": ["java"],
       "disabled": false,
       "initialization": {
