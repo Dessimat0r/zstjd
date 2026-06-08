@@ -18,6 +18,8 @@ public final class Compressor {
     private static final FseTable ML_DEC = FseTable.fromDist(ML_DIST, 6, 52);
 
     private static final int HASH_LOG = 14, HASH_SIZE = 1 << HASH_LOG, MIN_MATCH = 4, MAX_OFFSET = 1 << 18;
+    // Minimum match length for LZ77; lower = better compression ratio but higher false-match risk from hash collisions
+    private static final int MIN_MATCH_LEN = 8;
 
     public Compressor(int level) { this.level = level; }
     public void reset(int level) { this.level = level; }
@@ -48,7 +50,7 @@ public final class Compressor {
             int hdrPos = dstPos; dstPos += 3;
             int dataStart = dstPos;
 
-            int compSize = 0; // LZ77 needs more work; use raw blocks
+            int compSize = tryLz77(src, srcPos, chunk);
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
@@ -91,14 +93,14 @@ public final class Compressor {
         byte[] litCodes = new byte[size / 4 + 10], ofCodes = new byte[size / 4 + 10], mlCodes = new byte[size / 4 + 10];
 
         int pos = 0, lastPos = 0;
-        while (pos <= size - MIN_MATCH) {
+        while (pos <= size - MIN_MATCH_LEN) {
             int h = hash4(src, base + pos) & (HASH_SIZE - 1);
             int match = hashTable[h];
             hashTable[h] = pos;
             if (match >= 0 && pos - match <= MAX_OFFSET) {
                 int len = MIN_MATCH;
                 while (len < 131072 && pos + len < size && src[base + match + len] == src[base + pos + len]) len++;
-                if (len >= MIN_MATCH) {
+                if (len >= MIN_MATCH_LEN) {
                     int litLen = pos - lastPos;
                     int ofCode = offsetCode(pos - match);
                     litLens[seqCount] = litLen; offs[seqCount] = pos - match; matchLens[seqCount] = len;
