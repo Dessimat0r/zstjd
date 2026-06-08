@@ -7,6 +7,10 @@ public final class Compressor {
     private byte[] dst;
     private int dstPos;
 
+    private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
+    private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
+    private static final int[] ML_DIST = {1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+
     public Compressor(int level) { this.level = level; }
     public void reset(int level) { this.level = level; }
 
@@ -37,32 +41,31 @@ public final class Compressor {
         while (remaining > 0) {
             int chunk = Math.min(remaining, Constants.BLOCK_SIZE_MAX);
             boolean last = (remaining == chunk);
-            int blockSize = writeBestBlock(src, srcPos, chunk, last);
+            int blockStart = dstPos;
+            dstPos += 3; // placeholder for block header
+            int dataStart = dstPos;
+
+            // Try compressed, fall back to raw
+            int compressedLen = tryCompressBlock(src, srcPos, chunk);
+
+            if (compressedLen > 0 && compressedLen < chunk) {
+                int hdr = (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compressedLen << 3);
+                Constants.writeLE24(dst, blockStart, hdr);
+                dstPos = dataStart + compressedLen;
+            } else {
+                dstPos = dataStart;
+                ensure(chunk);
+                System.arraycopy(src, srcPos, dst, dstPos, chunk);
+                int hdr = (last ? 1 : 0) | (Constants.BLOCK_RAW << 1) | (chunk << 3);
+                Constants.writeLE24(dst, blockStart, hdr);
+                dstPos += chunk;
+            }
             srcPos += chunk;
             remaining -= chunk;
         }
     }
 
-    private int writeBestBlock(byte[] src, int srcPos, int size, boolean last) {
-        // Check RLE
-        if (size > 0) {
-            boolean allSame = true;
-            for (int i = 1; i < size && allSame; i++)
-                if (src[srcPos + i] != src[srcPos]) allSame = false;
-            if (allSame) {
-                ensure(7);
-                int hdr = (last ? 1 : 0) | (Constants.BLOCK_RLE << 1) | (size << 3);
-                Constants.writeLE24(dst, dstPos, hdr); dstPos += 3;
-                dst[dstPos++] = src[srcPos];
-                return size;
-            }
-        }
-        // Raw block
-        ensure(3 + size);
-        int hdr = (last ? 1 : 0) | (Constants.BLOCK_RAW << 1) | (size << 3);
-        Constants.writeLE24(dst, dstPos, hdr); dstPos += 3;
-        System.arraycopy(src, srcPos, dst, dstPos, size);
-        dstPos += size;
-        return size;
+    private int tryCompressBlock(byte[] src, int srcPos, int size) {
+        return 0; // placeholder - compressed block encoding not yet implemented
     }
 }
