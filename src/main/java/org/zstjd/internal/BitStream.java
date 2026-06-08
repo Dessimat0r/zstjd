@@ -19,8 +19,9 @@ public final class BitStream {
         bits += n;
     }
 
-    public void write(int state, int n) {
-        container |= (long) (state & ((1L << n) - 1)) << bits;
+    public void writeBitsMsb(int value, int n) {
+        int rev = Integer.reverse(value) >>> (32 - n);
+        container |= (long) (rev & ((1L << n) - 1)) << bits;
         bits += n;
     }
 

@@ -10,12 +10,12 @@ public final class Compressor {
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
     private static final int[] ML_DIST = {1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
-    private static final FseEncoder LL_TABLE, OF_TABLE, ML_TABLE;
-    static {
-        LL_TABLE = new FseEncoder(6, 35); LL_TABLE.init(LL_DIST, 35);
-        OF_TABLE = new FseEncoder(5, 30); OF_TABLE.init(OF_DIST, 28);
-        ML_TABLE = new FseEncoder(6, 52); ML_TABLE.init(ML_DIST, 52);
-    }
+    private static final FseEncoder LL_TABLE = new FseEncoder(FseTable.fromDist(LL_DIST, 6, 35));
+    private static final FseEncoder OF_TABLE = new FseEncoder(FseTable.fromDist(OF_DIST, 5, 28));
+    private static final FseEncoder ML_TABLE = new FseEncoder(FseTable.fromDist(ML_DIST, 6, 52));
+    private static final FseTable LL_DEC = FseTable.fromDist(LL_DIST, 6, 35);
+    private static final FseTable OF_DEC = FseTable.fromDist(OF_DIST, 5, 28);
+    private static final FseTable ML_DEC = FseTable.fromDist(ML_DIST, 6, 52);
 
     private static final int HASH_LOG = 14, HASH_SIZE = 1 << HASH_LOG, MIN_MATCH = 4, MAX_OFFSET = 1 << 18;
 
@@ -48,7 +48,7 @@ public final class Compressor {
             int hdrPos = dstPos; dstPos += 3;
             int dataStart = dstPos;
 
-            int compSize = 0; // disabled - FSE encoding needs more work
+            int compSize = tryLz77(src, srcPos, chunk);
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
@@ -143,59 +143,40 @@ public final class Compressor {
         }
         dst[dstPos++] = 0;
 
-        // Build decoding tables to find initial states
-        FseTable llDec = FseTable.fromDist(LL_DIST, 6, 35);
-        FseTable ofDec = FseTable.fromDist(OF_DIST, 5, 28);
-        FseTable mlDec = FseTable.fromDist(ML_DIST, 6, 52);
-
         BitStream stream = new BitStream(dst, dstPos);
         int streamStart = dstPos;
         int ls = seqCount - 1;
 
-        // Find initial states: any state that decodes to our symbol
-        int mlS = findState(mlDec, mlCodes[ls] & 0xFF);
-        int ofS = findState(ofDec, ofCodes[ls] & 0xFF);
-        int llS = findState(llDec, litCodes[ls] & 0xFF);
+        int llCode = litCodes[ls] & 0xFF, ofCode = ofCodes[ls] & 0xFF, mlCode = mlCodes[ls] & 0xFF;
+        int mlState = ML_TABLE.begin(mlCode);
+        int ofState = OF_TABLE.begin(ofCode);
+        int llState = LL_TABLE.begin(llCode);
 
-        // Write extra bits (litLen, matchLen, offset) in forward order
-        stream.writeBits(litLens[ls] - Constants.LITLEN_BASE[litCodes[ls] & 0xFF], Constants.LITLEN_BITS[litCodes[ls] & 0xFF]);
-        stream.writeBits(matchLens[ls] - Constants.MATCHLEN_BASE[mlCodes[ls] & 0xFF], Constants.MATCHLEN_BITS[mlCodes[ls] & 0xFF]);
-        int storedOffL = offs[ls] + 3;
-        stream.writeBits(storedOffL - Constants.OFFSET_BASE[ofCodes[ls] & 0xFF], Constants.OFFSET_BITS[ofCodes[ls] & 0xFF]);
+        // Extra bits for last sequence (MSB-first for backward reader)
+        stream.writeBitsMsb(litLens[ls] - Constants.LITLEN_BASE[llCode], Constants.LITLEN_BITS[llCode]);
+        stream.writeBitsMsb(matchLens[ls] - Constants.MATCHLEN_BASE[mlCode], Constants.MATCHLEN_BITS[mlCode]);
+        stream.writeBitsMsb(offs[ls] + 3 - Constants.OFFSET_BASE[ofCode], Constants.OFFSET_BITS[ofCode]);
         stream.flush();
 
-        // For multi-sequence, encode previous sequences
+        // Encode previous sequences in reverse order
         for (int s = seqCount - 2; s >= 0; s--) {
             int llc = litCodes[s] & 0xFF, ofc = ofCodes[s] & 0xFF, mlc = mlCodes[s] & 0xFF;
-            // Write state update bits for OF, ML, LL (reverse order for backward reading)
-            stream.writeBits(ofS, ofDec.numBits[ofS] & 0xFF);
-            stream.writeBits(mlS, mlDec.numBits[mlS] & 0xFF);
-            stream.writeBits(llS, llDec.numBits[llS] & 0xFF);
-            // Update states
-            ofS = (ofDec.newState[ofS] & 0xFFFF) + 0; // no extra bits for state update
-            mlS = (mlDec.newState[mlS] & 0xFFFF) + 0;
-            llS = (llDec.newState[llS] & 0xFFFF) + 0;
-            // Write extra bits
-            stream.writeBits(litLens[s] - Constants.LITLEN_BASE[llc], Constants.LITLEN_BITS[llc]);
-            stream.writeBits(matchLens[s] - Constants.MATCHLEN_BASE[mlc], Constants.MATCHLEN_BITS[mlc]);
-            int storedOffM = offs[s] + 3;
-            stream.writeBits(storedOffM - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
+            ofState = OF_TABLE.encode(stream, ofState, ofc);
+            mlState = ML_TABLE.encode(stream, mlState, mlc);
+            llState = LL_TABLE.encode(stream, llState, llc);
+            stream.writeBitsMsb(litLens[s] - Constants.LITLEN_BASE[llc], Constants.LITLEN_BITS[llc]);
+            stream.writeBitsMsb(matchLens[s] - Constants.MATCHLEN_BASE[mlc], Constants.MATCHLEN_BITS[mlc]);
+            stream.writeBitsMsb(offs[s] + 3 - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
             stream.flush();
         }
 
-        // Write initial states (at the END for backward reading order: LL, OF, ML)
-        stream.writeBits(mlS, mlDec.accuracyLog);
-        stream.writeBits(ofS, ofDec.accuracyLog);
-        stream.writeBits(llS, llDec.accuracyLog);
+        // Write initial states (backward order: LL reads first → write last)
+        ML_TABLE.finish(stream, mlState);
+        OF_TABLE.finish(stream, ofState);
+        LL_TABLE.finish(stream, llState);
         dstPos = streamStart + stream.close();
         int t = dstPos - outStart;
         return t >= size + 4 ? 0 : t;
-    }
-
-    private static int findState(FseTable t, int sym) {
-        for (int i = 0; i < t.tableSize; i++)
-            if ((t.symbol[i] & 0xFFFF) == sym) return i;
-        return 0;
     }
 
     private static int hash4(byte[] d, int p) {

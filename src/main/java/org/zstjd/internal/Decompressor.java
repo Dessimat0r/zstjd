@@ -104,12 +104,13 @@ public final class Decompressor {
         int modes = src[pos + consumed] & 0xFF; consumed++;
         int llM = (modes >> 6) & 3, ofM = (modes >> 4) & 3, mlM = (modes >> 2) & 3;
 
-        ForwardReader fr = new ForwardReader(src, pos + consumed);
+        int frStart = pos + consumed;
+        ForwardReader fr = new ForwardReader(src, frStart);
         llTable = readSeqTable(fr, llM, llTable, LL_DIST, 6, 35);
         ofTable = readSeqTable(fr, ofM, ofTable, OF_DIST, 5, 28);
         mlTable = readSeqTable(fr, mlM, mlTable, ML_DIST, 6, 52);
-        int fwdBytes = fr.bytePos(); fr.align();
-        consumed += fwdBytes;
+        int frEnd = fr.bytePos(); fr.align();
+        consumed += frEnd - frStart;
 
         int streamSize = max - consumed;
         if (streamSize <= 0) return max;
