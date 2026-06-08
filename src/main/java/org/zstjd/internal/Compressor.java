@@ -48,7 +48,7 @@ public final class Compressor {
             int hdrPos = dstPos; dstPos += 3;
             int dataStart = dstPos;
 
-            int compSize = tryLz77(src, srcPos, chunk);
+            int compSize = 0; // disabled - FSE encoding needs more work
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
@@ -116,16 +116,25 @@ public final class Compressor {
             litCodes[seqCount] = litLenCode(trailing); ofCodes[seqCount] = 0; mlCodes[seqCount] = 0;
             totalLits += trailing; seqCount++;
         }
-        if (seqCount <= 1) return 0;
+        if (seqCount == 0) return 0;
 
         int outStart = dstPos;
         ensure(2048 + totalLits);
 
-        int sf = Math.min(totalLits >> 4, 31);
-        dst[dstPos++] = (byte)((sf << 3) | 0);
-        dst[dstPos++] = (byte)(((totalLits & 0xF) << 4) | (totalLits & 0xF));
-        System.arraycopy(src, base, dst, dstPos, totalLits);
-        dstPos += totalLits;
+        // Write raw literals: bits 1-0 = block type (0=raw), bits 3-2 = size encoding type
+        if (totalLits < 32) {
+            dst[dstPos++] = (byte) ((0 << 2) | 0 | (totalLits << 3));
+        } else if (totalLits < 4096) {
+            int val = (1 << 2) | 0 | (totalLits << 4);
+            dst[dstPos++] = (byte)val; dst[dstPos++] = (byte)(val >> 8);
+        } else {
+            int val = (3 << 2) | 0 | (totalLits << 4);
+            dst[dstPos++] = (byte)val; dst[dstPos++] = (byte)(val >> 8); dst[dstPos++] = (byte)(val >> 16);
+        }
+        if (totalLits > 0) {
+            System.arraycopy(src, base, dst, dstPos, totalLits);
+            dstPos += totalLits;
+        }
 
         dst[dstPos++] = seqCount < 0x7F ? (byte)seqCount : (byte)((seqCount >> 8) | 0x80);
         if (seqCount >= 0x7F) {
@@ -134,36 +143,70 @@ public final class Compressor {
         }
         dst[dstPos++] = 0;
 
+        // Build decoding tables to find initial states
+        FseTable llDec = FseTable.fromDist(LL_DIST, 6, 35);
+        FseTable ofDec = FseTable.fromDist(OF_DIST, 5, 28);
+        FseTable mlDec = FseTable.fromDist(ML_DIST, 6, 52);
+
         BitStream stream = new BitStream(dst, dstPos);
         int streamStart = dstPos;
         int ls = seqCount - 1;
-        int mlS = ML_TABLE.begin(mlCodes[ls] & 0xFF), ofS = OF_TABLE.begin(ofCodes[ls] & 0xFF), llS = LL_TABLE.begin(litCodes[ls] & 0xFF);
+
+        // Find initial states: any state that decodes to our symbol
+        int mlS = findState(mlDec, mlCodes[ls] & 0xFF);
+        int ofS = findState(ofDec, ofCodes[ls] & 0xFF);
+        int llS = findState(llDec, litCodes[ls] & 0xFF);
+
+        // Write extra bits (litLen, matchLen, offset) in forward order
         stream.writeBits(litLens[ls] - Constants.LITLEN_BASE[litCodes[ls] & 0xFF], Constants.LITLEN_BITS[litCodes[ls] & 0xFF]);
         stream.writeBits(matchLens[ls] - Constants.MATCHLEN_BASE[mlCodes[ls] & 0xFF], Constants.MATCHLEN_BITS[mlCodes[ls] & 0xFF]);
-        stream.writeBits(offs[ls] - Constants.OFFSET_BASE[ofCodes[ls] & 0xFF], Constants.OFFSET_BITS[ofCodes[ls] & 0xFF]);
+        int storedOffL = offs[ls] + 3;
+        stream.writeBits(storedOffL - Constants.OFFSET_BASE[ofCodes[ls] & 0xFF], Constants.OFFSET_BITS[ofCodes[ls] & 0xFF]);
         stream.flush();
 
+        // For multi-sequence, encode previous sequences
         for (int s = seqCount - 2; s >= 0; s--) {
             int llc = litCodes[s] & 0xFF, ofc = ofCodes[s] & 0xFF, mlc = mlCodes[s] & 0xFF;
-            ofS = OF_TABLE.encode(stream, ofS, ofc);
-            mlS = ML_TABLE.encode(stream, mlS, mlc);
-            llS = LL_TABLE.encode(stream, llS, llc);
+            // Write state update bits for OF, ML, LL (reverse order for backward reading)
+            stream.writeBits(ofS, ofDec.numBits[ofS] & 0xFF);
+            stream.writeBits(mlS, mlDec.numBits[mlS] & 0xFF);
+            stream.writeBits(llS, llDec.numBits[llS] & 0xFF);
+            // Update states
+            ofS = (ofDec.newState[ofS] & 0xFFFF) + 0; // no extra bits for state update
+            mlS = (mlDec.newState[mlS] & 0xFFFF) + 0;
+            llS = (llDec.newState[llS] & 0xFFFF) + 0;
+            // Write extra bits
             stream.writeBits(litLens[s] - Constants.LITLEN_BASE[llc], Constants.LITLEN_BITS[llc]);
             stream.writeBits(matchLens[s] - Constants.MATCHLEN_BASE[mlc], Constants.MATCHLEN_BITS[mlc]);
-            stream.writeBits(offs[s] - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
+            int storedOffM = offs[s] + 3;
+            stream.writeBits(storedOffM - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
             stream.flush();
         }
-        ML_TABLE.finish(stream, mlS); OF_TABLE.finish(stream, ofS); LL_TABLE.finish(stream, llS);
+
+        // Write initial states (at the END for backward reading order: LL, OF, ML)
+        stream.writeBits(mlS, mlDec.accuracyLog);
+        stream.writeBits(ofS, ofDec.accuracyLog);
+        stream.writeBits(llS, llDec.accuracyLog);
         dstPos = streamStart + stream.close();
         int t = dstPos - outStart;
         return t >= size + 4 ? 0 : t;
+    }
+
+    private static int findState(FseTable t, int sym) {
+        for (int i = 0; i < t.tableSize; i++)
+            if ((t.symbol[i] & 0xFFFF) == sym) return i;
+        return 0;
     }
 
     private static int hash4(byte[] d, int p) {
         int h = (d[p]&0xFF)|((d[p+1]&0xFF)<<8)|((d[p+2]&0xFF)<<16);
         h ^= h >>> 15; h *= 0x85EBCA6B; h ^= h >>> 13; return h;
     }
-    private static int offsetCode(int off) { return off <= 0 ? 0 : Math.min(31 - Integer.numberOfLeadingZeros(off), 30); }
+    private static int offsetCode(int off) {
+        if (off <= 0) return 0;
+        int stored = off + 3;
+        return Math.min(31 - Integer.numberOfLeadingZeros(stored), 30);
+    }
     private static int matchLenCode(int len) { for (int i = Constants.MATCHLEN_BASE.length - 1; i >= 0; i--) if (Constants.MATCHLEN_BASE[i] <= len) return i; return 0; }
     private static byte litLenCode(int len) { for (int i = Constants.LITLEN_BASE.length - 1; i >= 0; i--) if (Constants.LITLEN_BASE[i] <= len) return (byte)i; return 0; }
 }

@@ -62,21 +62,29 @@ public final class Decompressor {
         byte[] literals = new byte[Constants.BLOCK_SIZE_MAX];
         int litLen = 0;
         int h = src[pos++] & 0xFF;
-        int type = (h >> 2) & 3, regen = h >> 3, s1, rawSize = 0;
-        if (regen < 32) { s1 = src[pos++] & 0xFF; regen = (regen << 4) | (s1 >> 4); rawSize = s1 & 0xF; }
-        else if (regen < 4096) { s1 = Constants.readLE16(src, pos); pos += 2; regen = (regen << 4) | (s1 >> 4); rawSize = s1 & 0xF; }
-        else { s1 = Constants.readLE32(src, pos) & 0xFFFFFF; pos += 3; regen = (regen << 4) | (s1 >> 4); rawSize = (s1 >> 4) & 0xFFFFF; }
+        int litBlockType = h & 3;
+        int sizeEnc = (h >> 2) & 3;
+        int regen;
+        if (sizeEnc == 0 || sizeEnc == 2) {
+            regen = h >>> 3;
+        } else if (sizeEnc == 1) {
+            regen = (h & 0xFF) | ((src[pos] & 0xFF) << 8);
+            regen >>>= 4; pos++;
+        } else {
+            regen = (h & 0xFF) | ((src[pos] & 0xFF) << 8) | ((src[pos + 1] & 0xFF) << 16);
+            regen >>>= 4; pos += 2;
+        }
 
-        if (type == Constants.LITERALS_RAW) {
+        if (litBlockType == 0) { // RAW
             litLen = regen;
             System.arraycopy(src, pos, literals, 0, regen);
             pos += regen;
-        } else if (type == Constants.LITERALS_RLE) {
+        } else if (litBlockType == 1) { // RLE
             litLen = regen;
             byte v = src[pos++];
             Arrays.fill(literals, 0, litLen, v);
         } else {
-            return size; // skip unsupported literals
+            return size; // skip unsupported compressed literals
         }
 
         if (pos - start >= size) return size;

@@ -6,9 +6,12 @@ public final class BitStream {
     private long container;
     private int bits;
 
+    private final int start;
+
     public BitStream(byte[] data, int start) {
         this.data = data;
         this.pos = start;
+        this.start = start;
     }
 
     public void writeBits(int value, int n) {
@@ -37,7 +40,7 @@ public final class BitStream {
             container = 0;
             bits = 0;
         }
-        return pos;
+        return pos - start;
     }
 
     public int position() {
