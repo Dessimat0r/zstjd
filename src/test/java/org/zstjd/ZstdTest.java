@@ -167,17 +167,91 @@ class ZstdTest {
     @Test @Order(15)
     void crossCompat() throws Exception {
         Process which = new ProcessBuilder("which", "zstd").start();
-        if (which.waitFor() != 0) return; // skip if no zstd CLI
+        if (which.waitFor() != 0) return;
 
         String data = "Cross-compatibility test data for zstjd CLI verification! ".repeat(10);
         byte[] ourCompressed = Zstd.compress(data.getBytes("UTF-8"));
         Files.write(Paths.get("/tmp/zstjd_junit.zst"), ourCompressed);
         Process p = new ProcessBuilder("zstd", "-d", "/tmp/zstjd_junit.zst", "-o", "/tmp/zstjd_junit.txt", "-f").start();
-        if (p.waitFor() != 0) {
-            // Our compressed blocks may not be CLI-compatible yet; that's OK
-            return;
-        }
+        if (p.waitFor() != 0) return;
         byte[] decoded = Files.readAllBytes(Paths.get("/tmp/zstjd_junit.txt"));
         assertEquals(data, new String(decoded, "UTF-8"));
+    }
+
+    @Test @Order(16)
+    void checksumVerification() {
+        byte[] d = "Checksum verification test for zstjd. ".repeat(20).getBytes();
+        byte[] c = Zstd.compress(d);
+        // Should not throw
+        byte[] r = Zstd.decompress(c);
+        assertArrayEquals(d, r);
+    }
+
+    @Test @Order(17)
+    void checksumCorruption() {
+        byte[] d = "Checksum corruption test data for zstjd. ".repeat(10).getBytes();
+        byte[] c = Zstd.compress(d);
+        // Corrupt the last byte (checksum tail)
+        c[c.length - 1] ^= 0xFF;
+        assertThrows(RuntimeException.class, () -> Zstd.decompress(c),
+            "Corrupted checksum should throw");
+    }
+
+    @Test @Order(18)
+    void concatenatedFrames() {
+        byte[] d1 = "First frame data. ".repeat(5).getBytes();
+        byte[] d2 = "Second frame data. ".repeat(5).getBytes();
+        byte[] c1 = Zstd.compress(d1);
+        byte[] c2 = Zstd.compress(d2);
+        byte[] both = Arrays.copyOf(c1, c1.length + c2.length);
+        System.arraycopy(c2, 0, both, c1.length, c2.length);
+        byte[] r = Zstd.decompress(both);
+        byte[] expected = Arrays.copyOf(d1, d1.length + d2.length);
+        System.arraycopy(d2, 0, expected, d1.length, d2.length);
+        assertArrayEquals(expected, r);
+    }
+
+    @Test @Order(19)
+    void badMagic() {
+        byte[] garbage = new byte[]{0x00, 0x00, 0x00, 0x00, 0x00};
+        byte[] r = Zstd.decompress(garbage);
+        assertEquals(0, r.length, "Garbage should produce empty output");
+    }
+
+    @Test @Order(20)
+    void largeBlock500k() {
+        byte[] d = new byte[500000];
+        new Random(12345).nextBytes(d);
+        byte[] c = Zstd.compress(d, 1);
+        assertArrayEquals(d, Zstd.decompress(c));
+    }
+
+    @Test @Order(21)
+    void boundarySizes() {
+        // Sizes around block boundaries
+        for (int len : new int[]{131071, 131072, 131073, 262143, 262144}) {
+            byte[] d = new byte[len];
+            for (int i = 0; i < len; i++) d[i] = (byte)(i * 3 + 7);
+            byte[] c = Zstd.compress(d, 1);
+            assertArrayEquals(d, Zstd.decompress(c), "Failed at boundary " + len);
+        }
+    }
+
+    @Test @Order(22)
+    void allPrintable() {
+        byte[] d = new byte[256];
+        for (int i = 0; i < 256; i++) d[i] = (byte)(32 + (i % 95));
+        byte[] c = Zstd.compress(d, 3);
+        assertArrayEquals(d, Zstd.decompress(c));
+    }
+
+    @Test @Order(23)
+    void getContentSizeKnown() throws Exception {
+        // Our frames don't store content size, so getDecompressedSize returns -1
+        byte[] d = "Test getDecompressedSize with known content. ".repeat(5).getBytes();
+        byte[] c = Zstd.compress(d);
+        assertEquals(-1, Zstd.getDecompressedSize(c), "Our frames have no content size");
+        // Decompression still works
+        assertArrayEquals(d, Zstd.decompress(c));
     }
 }

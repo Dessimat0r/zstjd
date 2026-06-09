@@ -30,6 +30,7 @@ public final class Decompressor {
             pos += 4;
             boolean hasChecksum = ((src[pos] >> 2) & 1) != 0;
             pos = parseFrameHeader(src, pos, end);
+            int frameStart = dstPos;
             while (pos + 3 <= end) {
                 int bh = Constants.readLE24(src, pos); pos += 3;
                 boolean last = (bh & 1) != 0;
@@ -40,7 +41,13 @@ public final class Decompressor {
                 else throw new IllegalArgumentException("Bad block type");
                 if (last) break;
             }
-            if (hasChecksum && pos + 4 <= end) { pos += 4; }
+            if (hasChecksum && pos + 4 <= end) {
+                int storedCk = Constants.readLE32(src, pos);
+                pos += 4;
+                long computedCk = XXH64.hash(dst, frameStart, dstPos - frameStart, 0);
+                if ((int)computedCk != storedCk)
+                    throw new RuntimeException("Checksum mismatch: frame=" + (frameStart) + " stored=0x" + Integer.toHexString(storedCk) + " computed=0x" + Integer.toHexString((int)computedCk));
+            }
         }
         return Arrays.copyOf(dst, dstPos);
     }
@@ -269,10 +276,10 @@ public final class Decompressor {
         boolean single = ((fhd >> 5) & 1) != 0;
         int skip = 5;
         if (!single) skip++;
-        if (fcsId == 1) return data.length >= skip + 2 ? (Constants.readLE16(data, skip) & 0xFFFF) + 256 : Constants.CONTENTSIZE_UNKNOWN;
-        if (fcsId == 2) return data.length >= skip + 4 ? Constants.readLE32(data, skip) : Constants.CONTENTSIZE_UNKNOWN;
+        if (fcsId == 0 && single) return data.length > skip ? data[skip] & 0xFF : Constants.CONTENTSIZE_UNKNOWN;
+        if (fcsId == 1) return data.length >= skip + 2 ? (Constants.readLE16(data, skip) & 0xFFFF) : Constants.CONTENTSIZE_UNKNOWN;
+        if (fcsId == 2) return data.length >= skip + 4 ? (int)(Constants.readLE32(data, skip) & 0xFFFFFFFFL) : Constants.CONTENTSIZE_UNKNOWN;
         if (fcsId == 3) return data.length >= skip + 8 ? (int) Constants.readLE64(data, skip) : Constants.CONTENTSIZE_UNKNOWN;
-        if (single) return data.length > skip ? data[skip] & 0xFF : Constants.CONTENTSIZE_UNKNOWN;
         return Constants.CONTENTSIZE_UNKNOWN;
     }
 
