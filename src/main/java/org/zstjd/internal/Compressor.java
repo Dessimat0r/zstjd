@@ -50,7 +50,7 @@ public final class Compressor {
             int hdrPos = dstPos; dstPos += 3;
             int dataStart = dstPos;
 
-            int compSize = 0; // LZ77 disabled for CLI compatibility
+            int compSize = 0; // LZ77 disabled for CLI bitstream compat
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
@@ -172,7 +172,7 @@ public final class Compressor {
             stream.flush();
         }
 
-        // Write initial states (each finish flushes, matching reference byte layout)
+        // Write initial states (each finish flushes, matching reference layout)
         ML_TABLE.finish(stream, mlState);
         OF_TABLE.finish(stream, ofState);
         LL_TABLE.finish(stream, llState);
