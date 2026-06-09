@@ -56,7 +56,9 @@ public final class Decompressor {
             if (dst.length < win) dst = new byte[win];
         }
         if (dst.length < 1 << 20) dst = new byte[1 << 20];
-        if (fcsId == 1) pos += 2;
+        if (fcsId == 0 && single) pos += 1;
+        else         if (fcsId == 0 && single) pos += 1;
+        else if (fcsId == 1) pos += 2;
         else if (fcsId == 2) pos += 4;
         else if (fcsId == 3) pos += 8;
         int dict = fhd & 3;

@@ -60,8 +60,15 @@ public final class Constants {
         return (d[o]&0xFFL)|((d[o+1]&0xFFL)<<8)|((d[o+2]&0xFFL)<<16)|((d[o+3]&0xFFL)<<24)
              | ((d[o+4]&0xFFL)<<32)|((d[o+5]&0xFFL)<<40)|((d[o+6]&0xFFL)<<48)|((d[o+7]&0xFFL)<<56);
     }
+    static void writeLE16(byte[] d, int o, int v) {
+        d[o]=(byte)v; d[o+1]=(byte)(v>>8);
+    }
     static void writeLE32(byte[] d, int o, int v) {
         d[o]=(byte)v; d[o+1]=(byte)(v>>8); d[o+2]=(byte)(v>>16); d[o+3]=(byte)(v>>24);
+    }
+    static void writeLE64(byte[] d, int o, long v) {
+        d[o]=(byte)v; d[o+1]=(byte)(v>>8); d[o+2]=(byte)(v>>16); d[o+3]=(byte)(v>>24);
+        d[o+4]=(byte)(v>>32); d[o+5]=(byte)(v>>40); d[o+6]=(byte)(v>>48); d[o+7]=(byte)(v>>56);
     }
     static void writeLE24(byte[] d, int o, int v) {
         d[o]=(byte)v; d[o+1]=(byte)(v>>8); d[o+2]=(byte)(v>>16);

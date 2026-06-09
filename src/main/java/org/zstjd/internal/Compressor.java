@@ -34,10 +34,28 @@ public final class Compressor {
         dst = new byte[(int) Math.min(maxOut, Integer.MAX_VALUE - 8)];
         dstPos = 0;
         Constants.writeLE32(dst, dstPos, Constants.ZSTD_MAGIC); dstPos += 4;
-        dst[dstPos++] = 0;
+
+        long srcLen = src.length;
+        boolean single = srcLen == 0 || srcLen <= (1L << 25);
+        int fcsId;
+        if (srcLen <= 255) fcsId = 0;
+        else if (srcLen <= 65535) fcsId = 1;
+        else if (srcLen <= (1L << 32) - 1) fcsId = 2;
+        else fcsId = 3;
+        int fhd = (fcsId << 6) | (single ? (1 << 5) : 0) | (1 << 2);
+        dst[dstPos++] = (byte)fhd;
         int wl = Math.max(17 + Math.min(8, level / 3), Constants.WINDOW_LOG_MIN);
-        dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
+        if (!single) {
+            dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
+        }
+        if (fcsId == 0 && single) dst[dstPos++] = (byte)srcLen;
+        else if (fcsId == 1) { Constants.writeLE16(dst, dstPos, (int)srcLen); dstPos += 2; }
+        else if (fcsId == 2) { Constants.writeLE32(dst, dstPos, (int)srcLen); dstPos += 4; }
+        else if (fcsId == 3) { Constants.writeLE64(dst, dstPos, srcLen); dstPos += 8; }
+
         writeBlocks(src);
+        long xxh = XXH64.hash(src, 0, src.length, 0);
+        Constants.writeLE32(dst, dstPos, (int)xxh); dstPos += 4;
         return Arrays.copyOf(dst, dstPos);
     }
 
@@ -48,36 +66,41 @@ public final class Compressor {
 
     private void writeBlocks(byte[] src) {
         int srcPos = 0, remaining = src.length;
-        while (remaining > 0) {
+        boolean first = true;
+        while (remaining > 0 || first) {
+            first = false;
             int chunk = Math.min(remaining, Constants.BLOCK_SIZE_MAX);
             boolean last = (remaining == chunk);
             int hdrPos = dstPos; dstPos += 3;
-            int dataStart = dstPos;
 
+            if (chunk == 0) {
+                Constants.writeLE24(dst, hdrPos, 1 | (Constants.BLOCK_RAW << 1));
+                break;
+            }
+
+            int dataStart = dstPos;
             int compSize = tryLz77(src, srcPos, chunk);
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
             } else {
                 dstPos = dataStart;
-                if (chunk > 0) {
-                    boolean allSame = true;
-                    int checkEnd = Math.min(chunk, 256);
-                    for (int i = 1; i < checkEnd; i++)
+                boolean allSame = chunk > 1;
+                int checkEnd = Math.min(chunk, 256);
+                for (int i = 1; i < checkEnd; i++)
+                    if (src[srcPos + i] != src[srcPos]) { allSame = false; break; }
+                if (allSame && chunk > 256) {
+                    for (int i = 256; i < chunk; i++)
                         if (src[srcPos + i] != src[srcPos]) { allSame = false; break; }
-                    if (allSame && chunk > 256) {
-                        for (int i = 256; i < chunk; i++)
-                            if (src[srcPos + i] != src[srcPos]) { allSame = false; break; }
-                    }
-                    if (allSame) {
-                        Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_RLE << 1) | (chunk << 3));
-                        dst[dstPos++] = src[srcPos];
-                    } else {
-                        ensure(chunk);
-                        System.arraycopy(src, srcPos, dst, dstPos, chunk);
-                        Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_RAW << 1) | (chunk << 3));
-                        dstPos += chunk;
-                    }
+                }
+                if (allSame) {
+                    Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_RLE << 1) | (chunk << 3));
+                    dst[dstPos++] = src[srcPos];
+                } else {
+                    ensure(chunk);
+                    System.arraycopy(src, srcPos, dst, dstPos, chunk);
+                    Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_RAW << 1) | (chunk << 3));
+                    dstPos += chunk;
                 }
             }
             srcPos += chunk;
