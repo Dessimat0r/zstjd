@@ -6,6 +6,11 @@ public final class Compressor {
     private int level;
     private byte[] dst;
     private int dstPos;
+    private int[] hashTable = new int[1 << 14];
+    private int[] litLens, offs, matchLens;
+    private byte[] litCodes, ofCodes, ofExtra, mlCodes;
+    private long[] prevOff = {1, 4, 8};
+    private boolean[] entropySeen = new boolean[256];
 
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
@@ -13,16 +18,12 @@ public final class Compressor {
     private static final FseEncoder LL_TABLE = new FseEncoder(FseTable.fromDist(LL_DIST, 6, 35));
     private static final FseEncoder OF_TABLE = new FseEncoder(FseTable.fromDist(OF_DIST, 5, 28));
     private static final FseEncoder ML_TABLE = new FseEncoder(FseTable.fromDist(ML_DIST, 6, 52));
-    private static final FseTable LL_DEC = FseTable.fromDist(LL_DIST, 6, 35);
-    private static final FseTable OF_DEC = FseTable.fromDist(OF_DIST, 5, 28);
-    private static final FseTable ML_DEC = FseTable.fromDist(ML_DIST, 6, 52);
 
     private static final int HASH_LOG = 14, HASH_SIZE = 1 << HASH_LOG, MIN_MATCH = 4, MAX_OFFSET = 1 << 18;
-    // Minimum match length for LZ77; lower = better compression ratio but higher false-match risk from hash collisions
     private static final int MIN_MATCH_LEN = 8;
 
-    public Compressor(int level) { this.level = level; }
-    public void reset(int level) { this.level = level; }
+    public Compressor(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; }
+    public void reset(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; }
 
     public byte[] compress(byte[] src) {
         long maxOut = Constants.compressBound(src.length);
@@ -58,8 +59,13 @@ public final class Compressor {
                 dstPos = dataStart;
                 if (chunk > 0) {
                     boolean allSame = true;
-                    for (int i = 1; i < chunk && allSame; i++)
-                        if (src[srcPos + i] != src[srcPos]) allSame = false;
+                    int checkEnd = Math.min(chunk, 256);
+                    for (int i = 1; i < checkEnd; i++)
+                        if (src[srcPos + i] != src[srcPos]) { allSame = false; break; }
+                    if (allSame && chunk > 256) {
+                        for (int i = 256; i < chunk; i++)
+                            if (src[srcPos + i] != src[srcPos]) { allSame = false; break; }
+                    }
                     if (allSame) {
                         Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_RLE << 1) | (chunk << 3));
                         dst[dstPos++] = src[srcPos];
@@ -81,30 +87,76 @@ public final class Compressor {
         // Quick entropy check: if too many unique bytes in first 64 bytes, skip
         int check = Math.min(size, 64);
         int unique = 0;
-        boolean[] seen = new boolean[256];
-        for (int i = 0; i < check; i++) { int b = src[base + i] & 0xFF; if (!seen[b]) { seen[b] = true; unique++; } }
+        if (check <= 64) {
+            for (int i = 0; i < check; i++) {
+                int b = src[base + i] & 0xFF;
+                if (!entropySeen[b]) { entropySeen[b] = true; unique++; }
+            }
+            for (int i = 0; i < check; i++) entropySeen[src[base + i] & 0xFF] = false;
+        }
         if (unique > Math.max(check / 2, 32)) return 0;
 
-        int[] hashTable = new int[HASH_SIZE];
-        Arrays.fill(hashTable, -1);
+        if (hashTable.length < HASH_SIZE) hashTable = new int[HASH_SIZE];
+        Arrays.fill(hashTable, 0, hashTable.length, -1);
+
+        int need = size / 4 + 10;
+        if (litLens == null || litLens.length < need) {
+            litLens = new int[need]; offs = new int[need]; matchLens = new int[need];
+            litCodes = new byte[need]; ofCodes = new byte[need]; mlCodes = new byte[need];
+            ofExtra = new byte[need];
+        }
 
         int seqCount = 0, totalLits = 0;
-        int[] litLens = new int[size / 4 + 10], offs = new int[size / 4 + 10], matchLens = new int[size / 4 + 10];
-        byte[] litCodes = new byte[size / 4 + 10], ofCodes = new byte[size / 4 + 10], mlCodes = new byte[size / 4 + 10];
+        prevOff[0] = 1; prevOff[1] = 4; prevOff[2] = 8;
 
         int pos = 0, lastPos = 0;
+        int pendingLit = -1;
         while (pos <= size - MIN_MATCH_LEN) {
             int h = hash4(src, base + pos) & (HASH_SIZE - 1);
             int match = hashTable[h];
             hashTable[h] = pos;
             if (match >= 0 && pos - match <= MAX_OFFSET) {
-                int len = MIN_MATCH;
-                while (len < 131072 && pos + len < size && src[base + match + len] == src[base + pos + len]) len++;
+                int len = matchLen(src, base + match, base + pos, Math.min(size - pos, 131072));
                 if (len >= MIN_MATCH_LEN) {
+                    // Lazy match: check if next position yields a longer match
+                    if (pos + 1 <= size - MIN_MATCH_LEN) {
+                        int nextH = hash4(src, base + pos + 1) & (HASH_SIZE - 1);
+                        int nextMatch = hashTable[nextH];
+                        if (nextMatch >= 0) {
+                            int nextLen = matchLen(src, base + nextMatch, base + pos + 1, Math.min(size - pos - 1, 131072));
+                            if (nextLen > len + 2) {
+                                pos++;
+                                continue;
+                            }
+                        }
+                    }
                     int litLen = pos - lastPos;
-                    int ofCode = offsetCode(pos - match);
-                    litLens[seqCount] = litLen; offs[seqCount] = pos - match; matchLens[seqCount] = len;
-                    litCodes[seqCount] = litLenCode(litLen); ofCodes[seqCount] = (byte)ofCode; mlCodes[seqCount] = (byte)matchLenCode(len);
+                    int off = pos - match;
+                    litLens[seqCount] = litLen; offs[seqCount] = off; matchLens[seqCount] = len;
+                    litCodes[seqCount] = litLenCode(litLen); mlCodes[seqCount] = (byte)matchLenCode(len);
+                    int ofc = offsetCode(off);
+                    int ofe = off + 3 - Constants.OFFSET_BASE[ofc];
+                    if (off == (int)prevOff[0] && (litLen > 0 || seqCount == 0)) {
+                        ofc = 0; ofe = 0;
+                    } else if (off == (int)prevOff[1]) {
+                        ofc = 1; ofe = 0;
+                    } else if (off == (int)prevOff[2] && litLen > 0) {
+                        ofc = 1; ofe = 1;
+                    }
+                    if (ofc == 0) {
+                        if (litLen == 0 && seqCount > 0) {
+                            long tmp = prevOff[0]; prevOff[0] = prevOff[1]; prevOff[1] = tmp;
+                        }
+                    } else if (ofc == 1 && ofe == 0) {
+                        long tmp = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = tmp;
+                    } else if (ofc == 1 && ofe == 1) {
+                        prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = off;
+                    } else {
+                        prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = off;
+                    }
+                    ofCodes[seqCount] = (byte)ofc;
+                    if (ofExtra == null || ofExtra.length < seqCount + 1) ofExtra = new byte[seqCount + 16];
+                    ofExtra[seqCount] = (byte)ofe;
                     totalLits += litLen; seqCount++;
                     pos += len; lastPos = pos; continue;
                 }
@@ -113,29 +165,48 @@ public final class Compressor {
         }
 
         int trailing = size - lastPos;
-        if (trailing > 0 || seqCount == 0) {
-            litLens[seqCount] = trailing; offs[seqCount] = 0; matchLens[seqCount] = 0;
-            litCodes[seqCount] = litLenCode(trailing); ofCodes[seqCount] = 0; mlCodes[seqCount] = 0;
-            totalLits += trailing; seqCount++;
-        }
         if (seqCount == 0) return 0;
+        totalLits += trailing;
 
         int outStart = dstPos;
-        ensure(2048 + totalLits);
+        ensure(2048 + totalLits + (totalLits / 4));
 
-        // Write raw literals: bits 1-0 = block type (0=raw), bits 3-2 = size encoding type
-        if (totalLits < 32) {
-            dst[dstPos++] = (byte) ((0 << 2) | 0 | (totalLits << 3));
-        } else if (totalLits < 4096) {
-            int val = (1 << 2) | 0 | (totalLits << 4);
-            dst[dstPos++] = (byte)val; dst[dstPos++] = (byte)(val >> 8);
-        } else {
-            int val = (3 << 2) | 0 | (totalLits << 4);
-            dst[dstPos++] = (byte)val; dst[dstPos++] = (byte)(val >> 8); dst[dstPos++] = (byte)(val >> 16);
+        // Write literals section – try Huffman if it saves space
+        int huffCompSize = 0;
+        if (totalLits > 8) {
+            int scratchPos = dstPos + 8;
+            ensure(scratchPos + totalLits + 16);
+            int cSize = Huff.compress(src, base, totalLits, dst, scratchPos);
+            if (cSize > 0 && cSize < totalLits) {
+                int regen = totalLits;
+                // Header: 3 bytes, Size_Format=00 (single stream)
+                // byte0: [00][compSize[9:8]][regen[9:8]][type=10]
+                // byte1: [compSize[7:0]]
+                // byte2: [regen[7:0]]
+                dst[dstPos] = (byte)(((cSize >> 8) & 3) << 4 | ((regen >> 8) & 3) << 2 | 2);
+                dst[dstPos + 1] = (byte)cSize;
+                dst[dstPos + 2] = (byte)regen;
+                System.arraycopy(dst, scratchPos, dst, dstPos + 3, cSize);
+                dstPos += 3 + cSize;
+                huffCompSize = 1;
+            }
         }
-        if (totalLits > 0) {
-            System.arraycopy(src, base, dst, dstPos, totalLits);
-            dstPos += totalLits;
+
+        if (huffCompSize == 0) {
+            // Write raw literals
+            if (totalLits < 32) {
+                dst[dstPos++] = (byte) ((0 << 2) | 0 | (totalLits << 3));
+            } else if (totalLits < 4096) {
+                int val = (1 << 2) | 0 | (totalLits << 4);
+                dst[dstPos++] = (byte)val; dst[dstPos++] = (byte)(val >> 8);
+            } else {
+                int val = (3 << 2) | 0 | (totalLits << 4);
+                dst[dstPos++] = (byte)val; dst[dstPos++] = (byte)(val >> 8); dst[dstPos++] = (byte)(val >> 16);
+            }
+            if (totalLits > 0) {
+                System.arraycopy(src, base, dst, dstPos, totalLits);
+                dstPos += totalLits;
+            }
         }
 
         dst[dstPos++] = seqCount < 0x7F ? (byte)seqCount : (byte)((seqCount >> 8) | 0x80);
@@ -157,7 +228,7 @@ public final class Compressor {
         // Extra bits for last sequence (LSB-first per reference spec)
         stream.writeBits(litLens[ls] - Constants.LITLEN_BASE[llCode], Constants.LITLEN_BITS[llCode]);
         stream.writeBits(matchLens[ls] - Constants.MATCHLEN_BASE[mlCode], Constants.MATCHLEN_BITS[mlCode]);
-        stream.writeBits(offs[ls] + 3 - Constants.OFFSET_BASE[ofCode], Constants.OFFSET_BITS[ofCode]);
+        stream.writeBits(ofExtra[ls] & 0xFF, Constants.OFFSET_BITS[ofCode]);
         stream.flush();
 
         // Encode previous sequences in reverse order
@@ -168,7 +239,7 @@ public final class Compressor {
             llState = LL_TABLE.encode(stream, llState, llc);
             stream.writeBits(litLens[s] - Constants.LITLEN_BASE[llc], Constants.LITLEN_BITS[llc]);
             stream.writeBits(matchLens[s] - Constants.MATCHLEN_BASE[mlc], Constants.MATCHLEN_BITS[mlc]);
-            stream.writeBits(offs[s] + 3 - Constants.OFFSET_BASE[ofc], Constants.OFFSET_BITS[ofc]);
+            stream.writeBits(ofExtra[s] & 0xFF, Constants.OFFSET_BITS[ofc]);
             stream.flush();
         }
 
@@ -179,6 +250,34 @@ public final class Compressor {
         dstPos = streamStart + stream.close();
         int t = dstPos - outStart;
         return t >= size + 4 ? 0 : t;
+    }
+
+    private static int matchLen(byte[] src, int a, int b, int max) {
+        int len = 0;
+        while (len + 8 <= max) {
+            long va = readLE64(src, a + len);
+            long vb = readLE64(src, b + len);
+            if (va != vb) {
+                int xor = (int)(va ^ vb);
+                xor = (xor & 0xFF) != 0 ? 0
+                    : (xor & 0xFF00) != 0 ? 1
+                    : (xor & 0xFF0000) != 0 ? 2
+                    : (xor & 0xFF000000) != 0 ? 3
+                    : (xor & 0xFF00000000L) != 0 ? 4
+                    : (xor & 0xFF0000000000L) != 0 ? 5
+                    : (xor & 0xFF000000000000L) != 0 ? 6
+                    : 7;
+                return len + xor;
+            }
+            len += 8;
+        }
+        while (len < max && src[a + len] == src[b + len]) len++;
+        return len;
+    }
+
+    private static long readLE64(byte[] d, int o) {
+        return (d[o]&0xFFL)|((d[o+1]&0xFFL)<<8)|((d[o+2]&0xFFL)<<16)|((d[o+3]&0xFFL)<<24)
+             | ((d[o+4]&0xFFL)<<32)|((d[o+5]&0xFFL)<<40)|((d[o+6]&0xFFL)<<48)|((d[o+7]&0xFFL)<<56);
     }
 
     private static int hash4(byte[] d, int p) {

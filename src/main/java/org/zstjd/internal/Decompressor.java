@@ -7,6 +7,7 @@ public final class Decompressor {
     private int dstPos;
     private FseTable llTable, ofTable, mlTable;
     private long[] prevOff = {1, 4, 8};
+    private byte[] literalsBuf = new byte[Constants.BLOCK_SIZE_MAX];
 
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
@@ -62,33 +63,59 @@ public final class Decompressor {
 
     private int decodeCompressed(byte[] src, int pos, int size) {
         int start = pos;
-        // Decode literals into temporary buffer
-        byte[] literals = new byte[Constants.BLOCK_SIZE_MAX];
+        // Decode literals into reusable buffer
+        if (literalsBuf.length < Constants.BLOCK_SIZE_MAX) literalsBuf = new byte[Constants.BLOCK_SIZE_MAX];
+        byte[] literals = literalsBuf;
         int litLen = 0;
         int h = src[pos++] & 0xFF;
         int litBlockType = h & 3;
-        int sizeEnc = (h >> 2) & 3;
-        int regen;
-        if (sizeEnc == 0 || sizeEnc == 2) {
-            regen = h >>> 3;
-        } else if (sizeEnc == 1) {
-            regen = (h & 0xFF) | ((src[pos] & 0xFF) << 8);
-            regen >>>= 4; pos++;
+        int sizeEnc = (h >> 6) & 3;
+        if (litBlockType == 0 || litBlockType == 1) {
+            // Raw or RLE: size encoding is at bits 2-3
+            int rawSizeEnc = (h >> 2) & 3;
+            int regen;
+            if (rawSizeEnc == 0 || rawSizeEnc == 2) {
+                regen = h >>> 3;
+            } else if (rawSizeEnc == 1) {
+                regen = (h & 0xFF) | ((src[pos] & 0xFF) << 8);
+                regen >>>= 4; pos++;
+            } else {
+                regen = (h & 0xFF) | ((src[pos] & 0xFF) << 8) | ((src[pos + 1] & 0xFF) << 16);
+                regen >>>= 4; pos += 2;
+            }
+            if (litBlockType == 0) { // RAW
+                litLen = regen;
+                System.arraycopy(src, pos, literals, 0, regen);
+                pos += regen;
+            } else { // RLE
+                litLen = regen;
+                byte v = src[pos++];
+                Arrays.fill(literals, 0, litLen, v);
+            }
+        } else if (litBlockType == 2) { // Compressed literals (Huffman)
+            // byte0: [sizeFormat(2)][compSizeHigh(2)][regenSizeHigh(2)][type=10(2)]
+            int regenSize, compSize;
+            if (sizeEnc == 0 || sizeEnc == 1) { // 3-byte header
+                regenSize = ((h >> 2) & 3) << 8 | (src[pos + 1] & 0xFF);
+                compSize = ((h >> 4) & 3) << 8 | (src[pos] & 0xFF);
+                pos += 2;
+            } else if (sizeEnc == 2) { // 4-byte header
+                regenSize = ((h >> 2) & 3) << 14 | (src[pos] & 0xFF) << 6 | ((src[pos + 1] >> 6) & 0x3F);
+                compSize = ((h >> 4) & 3) << 12 | (src[pos + 1] & 0x3F) << 6 | (src[pos + 2] & 0xFF);
+                pos += 3;
+            } else { // 5-byte header
+                regenSize = ((h >> 2) & 3) << 18 | (src[pos] & 0xFF) << 10 | ((src[pos + 1] & 0xFF) << 2) | ((src[pos + 2] >> 6) & 3);
+                compSize = ((h >> 4) & 3) << 16 | (src[pos + 2] & 0x3F) << 10 | ((src[pos + 3] & 0xFF) << 2) | ((src[pos + 4] >> 6) & 3);
+                pos += 5;
+            }
+            if (regenSize > literalsBuf.length) literalsBuf = new byte[regenSize];
+            literals = literalsBuf;
+            int decoded = Huff.decompress(src, pos, compSize, literals, 0, regenSize);
+            if (decoded != regenSize) return size;
+            litLen = regenSize;
+            pos += compSize;
         } else {
-            regen = (h & 0xFF) | ((src[pos] & 0xFF) << 8) | ((src[pos + 1] & 0xFF) << 16);
-            regen >>>= 4; pos += 2;
-        }
-
-        if (litBlockType == 0) { // RAW
-            litLen = regen;
-            System.arraycopy(src, pos, literals, 0, regen);
-            pos += regen;
-        } else if (litBlockType == 1) { // RLE
-            litLen = regen;
-            byte v = src[pos++];
-            Arrays.fill(literals, 0, litLen, v);
-        } else {
-            return size; // skip unsupported compressed literals
+            return size; // skip unsupported treeless literals
         }
 
         if (pos - start >= size) return size;
@@ -153,7 +180,7 @@ public final class Decompressor {
                 litIdx += litLen;
             }
 
-            if (matchLen > 0 && offset <= dstPos) {
+            if (matchLen > 0 && offset > 0 && offset <= dstPos) {
                 int sOff = dstPos - offset;
                 grow(dstPos + matchLen);
                 if (offset >= matchLen) System.arraycopy(dst, sOff, dst, dstPos, matchLen);
@@ -174,6 +201,12 @@ public final class Decompressor {
                 long ofNext = reader.readBits(ofNb);
                 ofSt = (ofTable.newState[ofSt] & 0xFFFF) + (int)ofNext;
             }
+        }
+        if (litIdx < litTotal) {
+            int last = litTotal - litIdx;
+            grow(dstPos + last);
+            System.arraycopy(literals, litIdx, dst, dstPos, last);
+            dstPos += last;
         }
         return consumed + streamSize;
     }
