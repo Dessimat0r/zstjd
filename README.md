@@ -144,4 +144,4 @@ Output is decodable by the reference `zstd` CLI across all sizes (0–100K+ veri
 
 ## License
 
-MIT
+BSD 2-Clause License — see [LICENSE](LICENSE)
