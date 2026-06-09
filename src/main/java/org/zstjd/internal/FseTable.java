@@ -48,19 +48,54 @@ public final class FseTable {
         int accLog = fr.read(4) + 5;
         if (accLog > 15) throw new RuntimeException("FSE accuracyLog too large: " + accLog);
         int size = 1 << accLog;
-        int remaining = size + 1;
         int[] count = new int[maxSym + 1];
-        for (int s = 0; s <= maxSym && remaining > 1; s++) {
-            int bits = 32 - Integer.numberOfLeadingZeros(remaining - 1);
-            int threshold = (1 << bits) - remaining;
-            int val = fr.read(bits);
+        int remaining = size + 1, threshold = size, nbBits = accLog + 1;
+        int charnum = 0;
+        boolean previous0 = false;
+
+        while (remaining > 1 && charnum <= maxSym) {
+            if (previous0) {
+                // Count zeros: read 2-bit repeat codes
+                int repeats;
+                do {
+                    repeats = fr.read(2);
+                    charnum += 3 * repeats;
+                } while (repeats == 3 && charnum <= maxSym);
+                if (charnum > maxSym) break;
+                // No more zero-count symbols to skip
+                previous0 = false;
+                if (remaining <= 1) break;
+            }
+
+            int max = (2 * threshold - 1) - remaining;
             int cnt;
-            if (val < threshold) cnt = val;
-            else cnt = val + fr.read(1) - threshold;
-            cnt++;
-            count[s] = cnt;
-            remaining -= cnt;
+            if (max >= 0) {
+                int val = fr.read(nbBits - 1);
+                if (val >= max) {
+                    int extra = fr.read(1);
+                    cnt = (val << 1) + extra - max;
+                } else {
+                    cnt = val;
+                }
+            } else {
+                cnt = fr.read(nbBits);
+            }
+            cnt--; // adjust for extra accuracy
+            if (cnt >= 0) {
+                remaining -= cnt;
+            } else {
+                // cnt == -1 means zero-count
+                previous0 = true;
+            }
+            count[charnum++] = cnt;
+
+            if (remaining < threshold) {
+                nbBits = 32 - Integer.numberOfLeadingZeros(remaining) + 1;
+                threshold = 1 << (nbBits - 1);
+            }
         }
+        if (remaining != 1) throw new RuntimeException("Corrupt FSE table");
+
         FseTable t = new FseTable(accLog);
         short[] stateDesc = new short[maxSym + 1];
         int high = size;

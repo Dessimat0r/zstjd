@@ -35,25 +35,14 @@ public final class Compressor {
         dstPos = 0;
         Constants.writeLE32(dst, dstPos, Constants.ZSTD_MAGIC); dstPos += 4;
 
-        long srcLen = src.length;
-        boolean single = srcLen == 0 || srcLen <= (1L << 25);
-        int fcsId;
-        if (srcLen <= 255) fcsId = 0;
-        else if (srcLen <= 65535) fcsId = 1;
-        else if (srcLen <= (1L << 32) - 1) fcsId = 2;
-        else fcsId = 3;
-        int fhd = (fcsId << 6) | (single ? (1 << 5) : 0) | (1 << 2);
-        dst[dstPos++] = (byte)fhd;
+        // Frame header: always singleSegment=0, no content size, checksum enabled
+        // Matches the reference CLI's conservative header format for best compatibility
+        dst[dstPos++] = (byte)(1 << 2); // FHD = 0x04: checksum, no content size, multi-segment
         int wl = Math.max(17 + Math.min(8, level / 3), Constants.WINDOW_LOG_MIN);
-        if (!single) {
-            dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
-        }
-        if (fcsId == 0 && single) dst[dstPos++] = (byte)srcLen;
-        else if (fcsId == 1) { Constants.writeLE16(dst, dstPos, (int)srcLen); dstPos += 2; }
-        else if (fcsId == 2) { Constants.writeLE32(dst, dstPos, (int)srcLen); dstPos += 4; }
-        else if (fcsId == 3) { Constants.writeLE64(dst, dstPos, srcLen); dstPos += 8; }
+        dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
 
         writeBlocks(src);
+        // Content checksum (XXH64 truncated to 4 bytes)
         long xxh = XXH64.hash(src, 0, src.length, 0);
         Constants.writeLE32(dst, dstPos, (int)xxh); dstPos += 4;
         return Arrays.copyOf(dst, dstPos);
@@ -309,7 +298,17 @@ public final class Compressor {
             if (seqCount < 0x7F00) dst[dstPos++] = (byte)seqCount;
             else { dst[dstPos - 1] = (byte)0xFF; dst[dstPos++] = (byte)(seqCount - 0x7F00); dst[dstPos++] = (byte)((seqCount - 0x7F00) >> 8); }
         }
-        dst[dstPos++] = 0;
+        // Write sequence FSE table modes
+        int[] llFreq = new int[36], ofFreq = new int[29], mlFreq = new int[53];
+        for (int i = 0; i < seqCount; i++) {
+            int llc = litCodes[i] & 0xFF, ofc = ofCodes[i] & 0xFF, mlc = mlCodes[i] & 0xFF;
+            if (llc < 36) llFreq[llc]++; if (ofc < 29) ofFreq[ofc]++; if (mlc < 53) mlFreq[mlc]++;
+        }
+        int llMode = 0, ofMode = 0, mlMode = 0, modePos = dstPos++;
+        if (maybeCompressedFse(llFreq, 6, 35))  { writeFseDist(llFreq, 6, 35); llMode = 2; }
+        if (maybeCompressedFse(ofFreq, 5, 28))  { writeFseDist(ofFreq, 5, 28); ofMode = 2; }
+        if (maybeCompressedFse(mlFreq, 6, 52))  { writeFseDist(mlFreq, 6, 52); mlMode = 2; }
+        dst[modePos] = (byte)((llMode << 6) | (ofMode << 4) | (mlMode << 2));
 
         BitStream stream = new BitStream(dst, dstPos);
         int streamStart = dstPos;
@@ -388,5 +387,121 @@ public final class Compressor {
     private static byte litLenCode(int len) { for (int i = Constants.LITLEN_BASE.length - 1; i >= 0; i--) if (Constants.LITLEN_BASE[i] <= len) return (byte)i; return 0; }
     private static boolean arraysEqual(int[] a, int[] b, int n) {
         for (int i = 0; i < n; i++) if (a[i] != b[i]) return false; return true;
+    }
+
+    private boolean maybeCompressedFse(int[] freqs, int accLog, int maxSym) {
+        int totalNz = 0;
+        for (int f : freqs) if (f > 0) totalNz++;
+        if (totalNz <= 3) return false;
+        int[] dist = maxSym > 40 ? ML_DIST : (maxSym > 30 ? LL_DIST : OF_DIST);
+        int diff = 0, check = Math.min(maxSym + 1, Math.min(dist.length, freqs.length));
+        for (int i = 0; i < check; i++) {
+            int df = dist[i] == -1 ? 1 : dist[i];
+            if (Math.abs(df - freqs[i]) > 2) diff++;
+        }
+        return diff > 6;
+    }
+
+    private void writeFseDist(int[] freqs, int accLog, int maxSym) {
+        int total = 0;
+        for (int f : freqs) total += f;
+        if (total <= 0) { writeFseRawZero(freqs, accLog, maxSym); return; }
+        int size = 1 << accLog;
+        int[] norm = new int[maxSym + 1];
+        int ns = 0, maxF = 0, maxI = 0;
+        for (int i = 0; i <= maxSym; i++) {
+            if (freqs[i] > 0) {
+                int n = Math.max(1, freqs[i] * size / total);
+                norm[i] = n; ns += n;
+                if (freqs[i] > maxF) { maxF = freqs[i]; maxI = i; }
+            }
+        }
+        int adj = size - ns;
+        if (adj != 0 && maxI <= maxSym) { norm[maxI] += adj; ns += adj; }
+        if (maxI <= maxSym && norm[maxI] < 1) norm[maxI] = 1;
+
+        int start = dstPos;
+        // Write bitstream header
+        long container = 0;
+        int nBits = 0, remaining = size + 1, threshold = size, nb = accLog + 1;
+        container |= (accLog - 5) & 0xFL; nBits += 4;
+        int sym = 0;
+        boolean prevZero = false;
+        while (remaining > 1 && sym <= maxSym) {
+            int cnt = norm[sym];
+            if (cnt <= 0) {
+                // Zero-count symbol - use 2-bit repeat encoding
+                int repeatStart = sym;
+                while (sym <= maxSym && (sym >= norm.length || norm[sym] <= 0)) sym++;
+                int zeros = sym - repeatStart;
+                while (zeros > 0) {
+                    int chunk = Math.min(zeros, 6); // max 6 zeros per 2-bit sequence
+                    while (chunk >= 3) {
+                        container |= 3L << nBits; nBits += 2; chunk -= 3;
+                    }
+                    if (chunk > 0) { container |= (long)(chunk & 3) << nBits; nBits += 2; }
+                    zeros -= chunk;
+                    zeros = Math.min(zeros, 6);
+                }
+                // Flush after zero-repeat
+                while (nBits >= 8) { dst[dstPos++] = (byte)container; container >>>= 8; nBits -= 8; }
+                if (sym > maxSym) break;
+                cnt = norm[sym];
+            }
+            // Encode count
+            int max = (2 * threshold - 1) - remaining;
+            if (max >= 0) {
+                if (cnt - 1 < max) {
+                    container |= (long)(cnt - 1) << nBits; nBits += nb - 1;
+                } else {
+                    int val = ((cnt - 1) + max) >>> 1;
+                    int low = ((cnt - 1) + max) & 1;
+                    container |= (long)val << nBits; nBits += nb - 1;
+                    container |= (long)low << nBits; nBits += 1;
+                }
+            } else {
+                container |= (long)(cnt - 1) << nBits; nBits += nb;
+            }
+            while (nBits >= 8) { dst[dstPos++] = (byte)container; container >>>= 8; nBits -= 8; }
+            if (cnt > 0) remaining -= cnt;
+            if (remaining < threshold && remaining > 1) {
+                nb = 32 - Integer.numberOfLeadingZeros(remaining) + 1;
+                threshold = 1 << (nb - 1);
+            }
+            sym++;
+        }
+        // Flush remaining bits
+        while (nBits > 0) { dst[dstPos++] = (byte)container; container >>>= 8; nBits -= 8; }
+        // Write accuracyLog into first nibble
+        dst[start] = (byte)((dst[start] & 0xF0) | (accLog - 5));
+    }
+
+    private void writeFseRawZero(int[] freqs, int accLog, int maxSym) {
+        int start = dstPos;
+        dst[dstPos++] = (byte)(accLog - 5);
+        // Write all counts as 1s (worst case)
+        long container = accLog - 5;
+        int bits = 4, size = 1 << accLog, remaining = size + 1, threshold = size, nb = accLog + 1;
+        for (int s = 0; s <= maxSym && remaining > 1; s++) {
+            int cnt = 1;
+            int max = (2 * threshold - 1) - remaining;
+            if (max >= 0) {
+                if (0 < max) {
+                    container |= 0L << bits; bits += nb - 1;
+                } else {
+                    container |= 0L << bits; bits += nb;
+                }
+            } else {
+                container |= 0L << bits; bits += nb;
+            }
+            while (bits >= 8) { dst[dstPos++] = (byte)container; container >>>= 8; bits -= 8; }
+            remaining -= cnt;
+            if (remaining < threshold) {
+                nb = 32 - Integer.numberOfLeadingZeros(remaining) + 1;
+                threshold = 1 << (nb - 1);
+            }
+        }
+        while (bits > 0) { dst[dstPos++] = (byte)container; container >>>= 8; bits -= 8; }
+        dst[start] = (byte)((dst[start] & 0xF0) | (accLog - 5));
     }
 }
