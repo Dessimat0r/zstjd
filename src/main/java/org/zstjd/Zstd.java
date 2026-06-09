@@ -48,8 +48,8 @@ public class Zstd {
             }
             // Wait for all and propagate exceptions
             for (var f : futures) {
-                try { f.get(); } catch (ExecutionException e) { throw new RuntimeException(e.getCause()); }
-                  catch (InterruptedException e) { throw new RuntimeException(e); }
+                try { f.get(); } catch (ExecutionException e) { throw new ZstdException(ZstdException.GENERIC, e.getCause().getMessage(), e.getCause()); }
+                  catch (InterruptedException e) { throw new ZstdException(ZstdException.GENERIC, e.getMessage(), e); }
             }
         }
 
@@ -87,6 +87,12 @@ public class Zstd {
         d.reset();
         d.useDict(dict);
         return d.decompress(data);
+    }
+
+    public static int decompress(byte[] data, byte[] output, int outputOffset) {
+        Decompressor d = TL_DECOMP.get();
+        d.reset();
+        return d.decompress(data, 0, data.length, output, outputOffset);
     }
 
     public static int getDecompressedSize(byte[] data) {

@@ -1,4 +1,5 @@
 package org.zstjd.internal;
+import org.zstjd.ZstdException;
 
 public final class FseTable {
     public final int accuracyLog;
@@ -46,7 +47,7 @@ public final class FseTable {
 
     public static FseTable readFrom(ForwardReader fr, int maxSym) {
         int accLog = fr.read(4) + 5;
-        if (accLog > 15) throw new RuntimeException("FSE accuracyLog too large: " + accLog);
+        if (accLog > 15) throw new ZstdException(ZstdException.CORRUPTION_DETECTED, "FSE accuracyLog too large: " + accLog);
         int size = 1 << accLog;
         int[] count = new int[maxSym + 1];
         int remaining = size + 1, threshold = size, nbBits = accLog + 1;
@@ -94,7 +95,7 @@ public final class FseTable {
                 threshold = 1 << (nbBits - 1);
             }
         }
-        if (remaining != 1) throw new RuntimeException("Corrupt FSE table");
+        if (remaining != 1) throw new ZstdException(ZstdException.CORRUPTION_DETECTED, "Corrupt FSE table");
 
         FseTable t = new FseTable(accLog);
         short[] stateDesc = new short[maxSym + 1];

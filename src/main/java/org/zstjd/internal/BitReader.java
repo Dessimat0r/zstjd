@@ -1,4 +1,5 @@
 package org.zstjd.internal;
+import org.zstjd.ZstdException;
 
 /** Container-based backward bitstream reader matching reference's BIT_DStream_t. */
 public final class BitReader {
@@ -8,7 +9,7 @@ public final class BitReader {
 
     public void init(byte[] src, int off, int len) {
         streamSize = len;
-        if (len < 1) throw new IllegalArgumentException("Empty bitstream");
+        if (len < 1) throw new ZstdException(ZstdException.CORRUPTION_DETECTED, "Empty bitstream");
 
         if (len >= 8) {
             // Load last 8 bytes as little-endian (MEM_readLEST)
@@ -28,7 +29,7 @@ public final class BitReader {
         }
 
         int lastByte = src[off + len - 1] & 0xFF;
-        if (lastByte == 0) throw new IllegalArgumentException("No end mark");
+        if (lastByte == 0) throw new ZstdException(ZstdException.CORRUPTION_DETECTED, "No end mark");
         int hb = 31 - Integer.numberOfLeadingZeros(lastByte);
         bitsConsumed = 8 - hb;
 

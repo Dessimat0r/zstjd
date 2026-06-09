@@ -2,6 +2,7 @@ package org.zstjd;
 
 import org.zstjd.internal.Decompressor;
 import java.io.*;
+import java.util.Arrays;
 
 public class ZstdInputStream extends InputStream {
     private final InputStream in;
@@ -10,6 +11,7 @@ public class ZstdInputStream extends InputStream {
     private int bufLen;
     private boolean eof;
     private boolean closed;
+    private final Decompressor decomp = new Decompressor();
 
     public ZstdInputStream(InputStream in) {
         this.in = in;
@@ -30,11 +32,9 @@ public class ZstdInputStream extends InputStream {
         while (copied < len) {
             if (bufPos >= bufLen) {
                 if (eof) return copied > 0 ? copied : -1;
-                byte[] newBuf = fillBuffer();
-                if (newBuf == null) { eof = true; return copied > 0 ? copied : -1; }
-                buf = newBuf;
+                fillBuffer();
+                if (bufLen == 0) { eof = true; return copied > 0 ? copied : -1; }
                 bufPos = 0;
-                bufLen = buf.length;
             }
             int avail = bufLen - bufPos;
             int take = Math.min(avail, len - copied);
@@ -45,19 +45,17 @@ public class ZstdInputStream extends InputStream {
         return copied;
     }
 
-    private byte[] fillBuffer() throws IOException {
+    private void fillBuffer() throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] tmp = new byte[4096];
+        byte[] readBuf = new byte[4096];
         int n;
-        while ((n = in.read(tmp)) >= 0) {
-            baos.write(tmp, 0, n);
-        }
+        while ((n = in.read(readBuf)) >= 0) baos.write(readBuf, 0, n);
         byte[] compressed = baos.toByteArray();
-        if (compressed.length == 0) return null;
-        Decompressor d = new Decompressor();
-        byte[] result = d.decompress(compressed);
+        if (compressed.length == 0) { bufLen = 0; return; }
+        decomp.reset();
+        byte[] result = decomp.decompress(compressed);
+        buf = result;
         bufLen = result.length;
-        return result;
     }
 
     @Override

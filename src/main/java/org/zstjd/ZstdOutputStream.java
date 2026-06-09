@@ -2,37 +2,46 @@ package org.zstjd;
 
 import org.zstjd.internal.Compressor;
 import java.io.*;
+import java.util.Arrays;
 
 public class ZstdOutputStream extends OutputStream {
     private final OutputStream out;
-    private final ByteArrayOutputStream buf = new ByteArrayOutputStream();
-    private int level;
+    private byte[] buf = new byte[8192];
+    private int bufPos;
+    private final int level;
     private boolean closed;
+    private final Compressor compressor;
 
     public ZstdOutputStream(OutputStream out) { this(out, 3); }
 
     public ZstdOutputStream(OutputStream out, int level) {
         this.out = out;
         this.level = level;
+        this.compressor = new Compressor(level);
     }
 
     @Override
     public void write(int b) throws IOException {
-        buf.write(b);
+        if (bufPos >= buf.length)
+            buf = Arrays.copyOf(buf, buf.length * 2);
+        buf[bufPos++] = (byte)b;
     }
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
-        buf.write(b, off, len);
+        if (bufPos + len > buf.length)
+            buf = Arrays.copyOf(buf, Math.max(buf.length * 2, bufPos + len));
+        System.arraycopy(b, off, buf, bufPos, len);
+        bufPos += len;
     }
 
     @Override
     public void flush() throws IOException {
-        if (buf.size() > 0) {
-            Compressor c = new Compressor(level);
-            byte[] compressed = c.compress(buf.toByteArray());
+        if (bufPos > 0) {
+            compressor.reset(level);
+            byte[] compressed = compressor.compress(Arrays.copyOf(buf, bufPos));
             out.write(compressed);
-            buf.reset();
+            bufPos = 0;
         }
         out.flush();
     }
@@ -41,7 +50,12 @@ public class ZstdOutputStream extends OutputStream {
     public void close() throws IOException {
         if (closed) return;
         closed = true;
-        flush();
+        if (bufPos > 0) {
+            compressor.reset(level);
+            byte[] compressed = compressor.compress(Arrays.copyOf(buf, bufPos));
+            out.write(compressed);
+            bufPos = 0;
+        }
         out.close();
     }
 }

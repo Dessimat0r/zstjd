@@ -1,4 +1,5 @@
 package org.zstjd.internal;
+import org.zstjd.ZstdException;
 
 import java.util.Arrays;
 
@@ -14,12 +15,12 @@ public final class Dict {
         int pos = 0;
         int magic = Constants.readLE32(data, pos); pos += 4;
         if (magic != 0xEC30A437)
-            throw new IllegalArgumentException("Bad dict magic: 0x" + Integer.toHexString(magic));
+            throw new ZstdException(ZstdException.PREFIX_UNKNOWN, "Bad dict magic: 0x" + Integer.toHexString(magic));
         int dictId = Constants.readLE32(data, pos); pos += 4;
 
         int[] codeLen = new int[256];
         int hdrSize = Huff.readHuffHeader(data, pos, data.length - pos, codeLen);
-        if (hdrSize <= 0) throw new RuntimeException("Bad dict huff header");
+        if (hdrSize <= 0) throw new ZstdException(ZstdException.LITERALS_HEADER_WRONG, "Bad dict huff header");
         pos += hdrSize;
         short[] huffTable = new short[1 << 12];
         byte[] huffNbBits = new byte[1 << 12];

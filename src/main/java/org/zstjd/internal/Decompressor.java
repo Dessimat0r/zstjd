@@ -1,4 +1,5 @@
 package org.zstjd.internal;
+import org.zstjd.ZstdException;
 
 import java.util.Arrays;
 
@@ -24,7 +25,29 @@ public final class Decompressor {
 
     public byte[] decompress(byte[] src) { return decompress(src, 0, src.length); }
 
+    public int decompress(byte[] src, int off, int len, byte[] out, int outOff) {
+        externalBuffer = true;
+        byte[] savedDst = dst;
+        int savedPos = dstPos;
+        dstPos = 0;
+        dst = out;
+        try {
+            decompressInternal(src, off, len);
+            return dstPos;
+        } finally {
+            dstPos = savedPos;
+            dst = savedDst;
+            externalBuffer = false;
+        }
+    }
+
     public byte[] decompress(byte[] src, int off, int len) {
+        externalBuffer = false;
+        decompressInternal(src, off, len);
+        return Arrays.copyOf(dst, dstPos);
+    }
+
+    private void decompressInternal(byte[] src, int off, int len) {
         dstPos = 0;
         int pos = off, end = off + len;
         while (pos + 4 <= end) {
@@ -48,7 +71,7 @@ public final class Decompressor {
                 if (type == Constants.BLOCK_RAW) { grow(dstPos + bSize); System.arraycopy(src, pos, dst, dstPos, bSize); dstPos += bSize; pos += bSize; }
                 else if (type == Constants.BLOCK_RLE) { byte v = src[pos++]; grow(dstPos + bSize); Arrays.fill(dst, dstPos, dstPos + bSize, v); dstPos += bSize; }
                 else if (type == Constants.BLOCK_COMPRESSED) { pos += decodeCompressed(src, pos, bSize); }
-                else throw new IllegalArgumentException("Bad block type");
+                else throw new ZstdException(ZstdException.CORRUPTION_DETECTED, "Bad block type");
                 if (last) break;
             }
             if (hasChecksum && pos + 4 <= end) {
@@ -56,10 +79,9 @@ public final class Decompressor {
                 pos += 4;
                 long computedCk = XXH64.hash(dst, frameStart, dstPos - frameStart, 0);
                 if ((int)computedCk != storedCk)
-                    throw new RuntimeException("Checksum mismatch: frame=" + (frameStart) + " stored=0x" + Integer.toHexString(storedCk) + " computed=0x" + Integer.toHexString((int)computedCk));
+                    throw new ZstdException(ZstdException.CHECKSUM_WRONG, "Checksum mismatch: frame=" + (frameStart) + " stored=0x" + Integer.toHexString(storedCk) + " computed=0x" + Integer.toHexString((int)computedCk));
             }
         }
-        return Arrays.copyOf(dst, dstPos);
     }
 
     private int parseFrameHeader(byte[] src, int pos, int end) {
@@ -335,7 +357,17 @@ public final class Decompressor {
         return Constants.CONTENTSIZE_UNKNOWN;
     }
 
+    private boolean externalBuffer;
     private void grow(int n) {
-        if (n > dst.length) dst = Arrays.copyOf(dst, Math.max(n, Math.max(dst.length * 2, 1 << 20)));
+        if (n > dst.length) {
+            if (externalBuffer)
+                throw new ZstdException(ZstdException.DST_SIZE_TOO_SMALL,
+                    "Output buffer too small: need " + n + " but have " + dst.length);
+            int newSize = Math.max(n, Math.max(dst.length * 2, 1 << 20));
+            if (newSize < 0 || newSize > Constants.MAX_DECOMPRESS_SIZE)
+                throw new ZstdException(ZstdException.DST_SIZE_TOO_SMALL,
+                    "Decompressed size too large: " + newSize);
+            dst = Arrays.copyOf(dst, newSize);
+        }
     }
 }
