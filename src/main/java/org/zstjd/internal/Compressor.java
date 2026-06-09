@@ -7,6 +7,7 @@ public final class Compressor {
     private byte[] dst;
     private int dstPos;
     private int[] hashTable = new int[1 << 14];
+    private int[] chainNext = new int[Constants.BLOCK_SIZE_MAX];
     private int[] litLens, offs, matchLens;
     private byte[] litCodes, ofCodes, ofExtra, mlCodes;
     private long[] prevOff = {1, 4, 8};
@@ -22,6 +23,7 @@ public final class Compressor {
 
     private static final int HASH_LOG = 14, HASH_SIZE = 1 << HASH_LOG, MIN_MATCH = 4, MAX_OFFSET = 1 << 18;
     private static final int MIN_MATCH_LEN = 8;
+    private static final int MAX_CHAIN = 64;
 
     public Compressor(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; }
     public void reset(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; huffCodeLen = null; }
@@ -110,58 +112,121 @@ public final class Compressor {
         int seqCount = 0, totalLits = 0;
         prevOff[0] = 1; prevOff[1] = 4; prevOff[2] = 8;
 
-        int pos = 0, lastPos = 0;
-        while (pos <= size - MIN_MATCH_LEN) {
-            int h = hash4(src, base + pos) & (HASH_SIZE - 1);
-            int match = hashTable[h];
-            hashTable[h] = pos;
-            if (match >= 0 && pos - match <= MAX_OFFSET) {
-                int len = matchLen(src, base + match, base + pos, Math.min(size - pos, 131072));
-                if (len >= MIN_MATCH_LEN) {
-                    // Lazy match: check if next position yields longer match
-                    if (pos + 1 <= size - MIN_MATCH_LEN) {
-                        int nextH = hash4(src, base + pos + 1) & (HASH_SIZE - 1);
-                        int nextMatch = hashTable[nextH];
-                        if (nextMatch >= 0) {
-                            int nextLen = matchLen(src, base + nextMatch, base + pos + 1, Math.min(size - pos - 1, 131072));
-                            if (nextLen > len + 2) {
-                                pos++;
-                                continue;
-                            }
-                        }
-                    }
-                    int litLen = pos - lastPos;
-                    int off = pos - match;
-                    litLens[seqCount] = litLen; offs[seqCount] = off; matchLens[seqCount] = len;
-                    litCodes[seqCount] = litLenCode(litLen); mlCodes[seqCount] = (byte)matchLenCode(len);
-                    int ofc = offsetCode(off);
-                    int ofe = off + 3 - Constants.OFFSET_BASE[ofc];
-                    if (off == (int)prevOff[0] && (litLen > 0 || seqCount == 0)) {
-                        ofc = 0; ofe = 0;
-                    } else if (off == (int)prevOff[1]) {
-                        ofc = 1; ofe = 0;
-                    } else if (off == (int)prevOff[2] && litLen > 0) {
-                        ofc = 1; ofe = 1;
-                    }
-                    if (ofc == 0) {
-                        if (litLen == 0 && seqCount > 0) {
-                            long tmp = prevOff[0]; prevOff[0] = prevOff[1]; prevOff[1] = tmp;
-                        }
-                    } else if (ofc == 1 && ofe == 0) {
-                        long tmp = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = tmp;
-                    } else if (ofc == 1 && ofe == 1) {
-                        prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = off;
-                    } else {
-                        prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = off;
-                    }
-                    ofCodes[seqCount] = (byte)ofc;
-                    if (ofExtra == null || ofExtra.length < seqCount + 1) ofExtra = new byte[seqCount + 16];
-                    ofExtra[seqCount] = (byte)ofe;
-                    totalLits += litLen; seqCount++;
-                    pos += len; lastPos = pos; continue;
-                }
+        // Build hash chain
+        if (chainNext.length < size) chainNext = new int[size + 1];
+        int[] cost = new int[size + 1];
+        int[] prevPos = new int[size + 1];  // previous position in optimal path
+        int[] matchLenAt = new int[size + 1];  // match length (-1 = literal)
+        int[] matchOffAt = new int[size + 1];
+        // Initialize
+        cost[0] = 0;
+        for (int i = 1; i <= size; i++) cost[i] = Integer.MAX_VALUE;
+
+        for (int p = 0; p < size; p++) {
+            if (cost[p] == Integer.MAX_VALUE) continue;
+
+            // Option 1: literal byte
+            int litCost = cost[p] + 8;
+            if (litCost < cost[p + 1]) {
+                cost[p + 1] = litCost;
+                prevPos[p + 1] = p;
+                matchLenAt[p + 1] = -1;
             }
-            pos++;
+
+            // Option 2: match at current position (if available)
+            // Must get hash / save old head BEFORE updating the chain
+            int matchH = -1;
+            int matchOff = 0;
+            if (p <= size - MIN_MATCH_LEN) {
+                int h = hash4(src, base + p) & (HASH_SIZE - 1);
+                matchH = hashTable[h];  // save old head before updating
+                // Update hash chain
+                if (p <= size - MIN_MATCH_LEN - 3) {
+                    chainNext[p] = matchH;
+                    hashTable[h] = p;
+                }
+                if (matchH >= 0 && p - matchH <= MAX_OFFSET) {
+                    int len = matchLen(src, base + matchH, base + p, Math.min(size - p, 131072));
+                    if (len >= MIN_MATCH_LEN) {
+                        int end = p + len;
+                        if (end > size) end = size;
+                        int mlCode = matchLenCode(len);
+                        int ofCode = offsetCode(p - matchH);
+                        int mLBits = Constants.MATCHLEN_BITS[mlCode];
+                        int oBits = Constants.OFFSET_BITS[ofCode];
+                        int estCost = cost[p] + 16 + mLBits + oBits;
+                        if (estCost < cost[end]) {
+                            cost[end] = estCost;
+                            prevPos[end] = p;
+                            matchLenAt[end] = len;
+                            matchOffAt[end] = p - matchH;
+                        }
+                    }
+                }
+            } else if (p <= size - 4) {
+                int h = hash4(src, base + p) & (HASH_SIZE - 1);
+                chainNext[p] = hashTable[h];
+                hashTable[h] = p;
+            }
+        }
+
+        // Traceback
+        int p = size;
+        java.util.ArrayList<Integer> seqStarts = new java.util.ArrayList<>();
+        java.util.ArrayList<Integer> seqLens = new java.util.ArrayList<>();
+        java.util.ArrayList<Integer> seqOffs = new java.util.ArrayList<>();
+        while (p > 0) {
+            int prev = prevPos[p];
+            int len = matchLenAt[p];
+            if (len > 0) {
+                seqStarts.add(prev);
+                seqLens.add(len);
+                seqOffs.add(matchOffAt[p]);
+            }
+            p = prev;
+        }
+
+        // Convert to forward order
+        seqCount = 0;
+        totalLits = 0;
+        int lastPos = 0;
+        for (int i = seqStarts.size() - 1; i >= 0; i--) {
+            int start = seqStarts.get(i);
+            int len = seqLens.get(i);
+            int off = seqOffs.get(i);
+            int litLen = start - lastPos;
+            if (litLen > 0) {
+                totalLits += litLen;
+            }
+            if (len > 0) {
+                litLens[seqCount] = litLen; offs[seqCount] = off; matchLens[seqCount] = len;
+                litCodes[seqCount] = litLenCode(litLen); mlCodes[seqCount] = (byte)matchLenCode(len);
+                int ofc = offsetCode(off);
+                int ofe = off + 3 - Constants.OFFSET_BASE[ofc];
+                if (off == (int)prevOff[0] && (litLen > 0 || seqCount == 0)) {
+                    ofc = 0; ofe = 0;
+                } else if (off == (int)prevOff[1]) {
+                    ofc = 1; ofe = 0;
+                } else if (off == (int)prevOff[2] && litLen > 0) {
+                    ofc = 1; ofe = 1;
+                }
+                if (ofc == 0) {
+                    if (litLen == 0 && seqCount > 0) {
+                        long tmp = prevOff[0]; prevOff[0] = prevOff[1]; prevOff[1] = tmp;
+                    }
+                } else if (ofc == 1 && ofe == 0) {
+                    long tmp = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = tmp;
+                } else if (ofc == 1 && ofe == 1) {
+                    prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = off;
+                } else {
+                    prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = off;
+                }
+                ofCodes[seqCount] = (byte)ofc;
+                if (ofExtra == null || ofExtra.length < seqCount + 1) ofExtra = new byte[seqCount + 16];
+                ofExtra[seqCount] = (byte)ofe;
+                seqCount++;
+                lastPos = start + len;
+            }
         }
         int trailing = size - lastPos;
         if (seqCount == 0) return 0;
