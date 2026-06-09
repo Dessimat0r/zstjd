@@ -13,75 +13,7 @@ public final class Huff {
     // ---------- Encoding ----------
 
     public static int compress(byte[] src, int off, int len, byte[] dst, int dstOff) {
-        if (len <= 0) return 0;
-
-        // Count frequencies
-        int[] freqs = new int[MAX_SYMBOLS];
-        for (int i = 0; i < len; i++) freqs[src[off + i] & 0xFF]++;
-
-        int numSymbols = 0;
-        for (int f : freqs) if (f > 0) numSymbols++;
-
-        // RLE case: all same byte
-        if (numSymbols == 1) {
-            for (int i = 0; i < MAX_SYMBOLS; i++) {
-                if (freqs[i] > 0) {
-                    dst[dstOff] = (byte)(i >> 8);
-                    dst[dstOff + 1] = (byte)i;
-                    return 2;
-                }
-            }
-        }
-
-        if (numSymbols == 0) return 0;
-
-        // Build code lengths via simple iterative approach
-        int[] codeLen = computeCodeLengths(freqs, MAX_CODE_LEN);
-        if (codeLen == null) return 0;
-
-        // Build encoding table
-        int[] codeWord = new int[MAX_SYMBOLS];
-        int[] codeBits = new int[MAX_SYMBOLS];
-        buildEncodingTable(codeLen, codeWord, codeBits);
-
-        // Write Huffman tree description (weights as 4-bit nibbles)
-        int headerSize = writeHuffHeader(dst, dstOff, codeLen);
-
-        // Encode literals into bitstream
-        int bitstreamStart = dstOff + headerSize;
-        int maxOut = dst.length - bitstreamStart;
-        if (maxOut < 4) return 0;
-
-        int pos = bitstreamStart;
-        long container = 0;
-        int bits = 0;
-
-        for (int i = 0; i < len; i++) {
-            int sym = src[off + i] & 0xFF;
-            long code = codeWord[sym] & 0xFFFFL;
-            int nb = codeBits[sym];
-            container |= code << bits;
-            bits += nb;
-            while (bits >= 8) {
-                if (pos >= dst.length) return 0;
-                dst[pos++] = (byte)container;
-                container >>>= 8;
-                bits -= 8;
-            }
-        }
-        // End mark
-        container |= 1L << bits;
-        bits++;
-        while (bits > 0) {
-            if (pos >= dst.length) return 0;
-            dst[pos++] = (byte)container;
-            container >>>= 8;
-            bits -= 8;
-        }
-
-        int compSize = pos - bitstreamStart;
-        int totalSize = headerSize + compSize;
-        return totalSize;
+        return compressBody(src, off, len, dst, dstOff, false);
     }
 
     private static int[] computeCodeLengths(int[] freqs, int maxBits) {
@@ -227,18 +159,158 @@ public final class Huff {
         return pos - off;
     }
 
+    // ---------- Treeless / table reuse ----------
+
+    public static int[] computeCodeLengths2(byte[] src, int off, int len, int maxBits) {
+        if (len <= 0) return null;
+        int[] freqs = new int[MAX_SYMBOLS];
+        for (int i = 0; i < len; i++) freqs[src[off + i] & 0xFF]++;
+        return computeCodeLengths(freqs, maxBits);
+    }
+
+    public static int compressTreeless(byte[] src, int off, int len, byte[] dst, int dstOff) {
+        return compressBody(src, off, len, dst, dstOff, true);
+    }
+
+    private static int compressBody(byte[] src, int off, int len, byte[] dst, int dstOff, boolean treeless) {
+        if (len <= 0) return 0;
+        int[] freqs = new int[MAX_SYMBOLS];
+        for (int i = 0; i < len; i++) freqs[src[off + i] & 0xFF]++;
+        int[] codeLen = computeCodeLengths(freqs, MAX_CODE_LEN);
+        if (codeLen == null) return 0;
+        return compressWithTable(src, off, len, dst, dstOff, codeLen, treeless);
+    }
+
+    private static int compressWithTable(byte[] src, int off, int len, byte[] dst, int dstOff, int[] codeLen, boolean treeless) {
+        int[] codeWord = new int[MAX_SYMBOLS];
+        int[] codeBits = new int[MAX_SYMBOLS];
+        buildEncodingTable(codeLen, codeWord, codeBits);
+        int headerSize = treeless ? 0 : writeHuffHeader(dst, dstOff, codeLen);
+        int bodyOff = dstOff + headerSize;
+        int bodySize;
+        if (len > 1024) {
+            bodySize = compress4(src, off, len, dst, bodyOff, codeWord, codeBits);
+        } else {
+            bodySize = writeBitstream(src, off, len, dst, bodyOff, codeWord, codeBits);
+        }
+        return headerSize + bodySize;
+    }
+
+    private static int writeBitstream(byte[] src, int off, int len, byte[] dst, int dstOff, int[] codeWord, int[] codeBits) {
+        return bitstreamSize(src, off, len, dst, dstOff, codeWord, codeBits);
+    }
+
+    private static int bitstreamSize(byte[] src, int off, int len, byte[] dst, int dstOff, int[] codeWord, int[] codeBits) {
+        int pos = dstOff;
+        long container = 0;
+        int bits = 0;
+        int maxOut = dst.length - dstOff;
+        for (int i = 0; i < len; i++) {
+            int sym = src[off + i] & 0xFF;
+            container |= (codeWord[sym] & 0xFFFFL) << bits;
+            bits += codeBits[sym];
+            while (bits >= 8) {
+                if (pos - dstOff >= maxOut) return 0;
+                dst[pos++] = (byte)container;
+                container >>>= 8;
+                bits -= 8;
+            }
+        }
+        container |= 1L << bits;
+        bits++;
+        while (bits > 0) {
+            if (pos - dstOff >= maxOut) return 0;
+            dst[pos++] = (byte)container;
+            container >>>= 8;
+            bits -= 8;
+        }
+        return pos - dstOff;
+    }
+
+    // 4-stream variants
+    private static int compress4(byte[] src, int off, int len, byte[] dst, int dstOff, int[] codeWord, int[] codeBits) {
+        // Split input into 4 roughly equal segments
+        int segLen = (len + 3) / 4;
+        int[] segSizes = new int[4];
+        int totalComp = 0;
+        int writePos = dstOff;
+        // Reserve space for jump table (4 × 2 bytes)
+        int jumpOff = writePos;
+        writePos += 8;
+        for (int i = 0; i < 4; i++) {
+            int segOff = off + Math.min(i * segLen, len);
+            int segEnd = Math.min((i + 1) * segLen, len);
+            int segSz = segEnd - (segOff - off);
+            if (segSz <= 0) { segSizes[i] = 0; continue; }
+            int sz = bitstreamSize(src, segOff, segSz, dst, writePos, codeWord, codeBits);
+            segSizes[i] = sz;
+            writePos += sz;
+            totalComp += sz;
+        }
+        // Write jump table (little-endian 16-bit sizes)
+        for (int i = 0; i < 4; i++) {
+            dst[jumpOff + i * 2] = (byte)(segSizes[i] & 0xFF);
+            dst[jumpOff + i * 2 + 1] = (byte)((segSizes[i] >> 8) & 0xFF);
+        }
+        return 8 + totalComp;
+    }
+
+    public static int decodeStream4(byte[] src, int off, int size, byte[] dst, int dstOff, int expected,
+                                      short[] decodeTable, byte[] decodeNbBits, int tableLog) {
+        if (size < 8) return 0;
+        int tableMask = (1 << tableLog) - 1;
+        // Read jump table
+        int[] streamOff = new int[4];
+        int[] streamSize = new int[4];
+        int pos = off;
+        for (int i = 0; i < 4; i++) {
+            int sz = (src[pos] & 0xFF) | ((src[pos + 1] & 0xFF) << 8);
+            streamSize[i] = sz;
+            pos += 2;
+        }
+        for (int i = 0; i < 4; i++) {
+            streamOff[i] = pos;
+            pos += streamSize[i];
+        }
+
+        // 4 containers for 4 streams
+        long[] containers = new long[4];
+        int[] bits = new int[4];
+        int[] readPos = new int[4];
+        for (int i = 0; i < 4; i++) {
+            readPos[i] = streamOff[i];
+        }
+
+        int writeIdx = dstOff;
+        while (writeIdx < dstOff + expected) {
+            for (int s = 0; s < 4; s++) {
+                if (writeIdx >= dstOff + expected) break;
+                // Refill container
+                while (bits[s] <= 56 && readPos[s] < streamOff[s] + streamSize[s]) {
+                    containers[s] |= (long)(src[readPos[s]++] & 0xFF) << bits[s];
+                    bits[s] += 8;
+                }
+                if (bits[s] <= 0) continue;
+
+                int entry = decodeTable[(int)(containers[s] & tableMask)] & 0xFFFF;
+                int sym = entry & 0xFF;
+                int nbBits = (entry >> 8) & 0xFF;
+                if (nbBits <= 0 || nbBits > bits[s]) break;
+                dst[writeIdx++] = (byte)sym;
+                containers[s] >>>= nbBits;
+                bits[s] -= nbBits;
+            }
+        }
+        return writeIdx - dstOff;
+    }
+
     // ---------- Decoding ----------
 
-    public static int decompress(byte[] src, int off, int size, byte[] dst, int dstOff, int expected) {
-        if (size <= 0 || expected <= 0) return 0;
-
+    public static int readHuffHeader(byte[] src, int off, int size, int[] codeLen) {
         int pos = off;
-
-        // Read header
         int weightCount = (src[pos++] & 0xFF) + 1;
-        if (weightCount > MAX_SYMBOLS) return 0;
+        if (weightCount > MAX_SYMBOLS) return -1;
 
-        int[] codeLen = new int[MAX_SYMBOLS];
         int nibblePos = 0;
         for (int i = 0; i < weightCount; i++) {
             int w;
@@ -252,41 +324,56 @@ public final class Huff {
             codeLen[i] = w;
         }
         if (nibblePos % 2 != 0) pos++;
-        if (nibblePos < weightCount + 1) pos = Math.min(pos + 1, off + size);
+        return pos - off;
+    }
 
-        int bitstreamOff = pos;
-        int bitstreamSize = size - (bitstreamOff - off);
+    public static int buildTable(int[] codeLen, short[] decodeTable, byte[] decodeNbBits) {
+        return buildDecodingTable(codeLen, decodeTable, decodeNbBits);
+    }
+
+    public static int decompress(byte[] src, int off, int size, byte[] dst, int dstOff, int expected) {
+        if (size <= 0 || expected <= 0) return 0;
+
+        int[] codeLen = new int[MAX_SYMBOLS];
+        int hdrSize = readHuffHeader(src, off, size, codeLen);
+        if (hdrSize < 0) return 0;
+
+        int bitstreamOff = off + hdrSize;
+        int bitstreamSize = size - hdrSize;
         if (bitstreamSize <= 0) return 0;
 
-        // Build decoding table
         short[] decodeTable = new short[MAX_TABLE_SIZE];
         byte[] decodeNbBits = new byte[MAX_TABLE_SIZE];
         int tableLog = buildDecodingTable(codeLen, decodeTable, decodeNbBits);
 
         if (tableLog <= 0) {
-            // Try RLE
             int sym = 0;
             for (int i = 0; i < MAX_SYMBOLS; i++) if (codeLen[i] > 0) { sym = i; break; }
             Arrays.fill(dst, dstOff, dstOff + expected, (byte)sym);
-            return size;
+            return expected;
         }
 
-        // Decode bitstream
+        int decoded = decodeStream(src, bitstreamOff, bitstreamSize, dst, dstOff, expected, decodeTable, decodeNbBits, tableLog);
+        return decoded;
+    }
+
+    public static int decodeStream(byte[] src, int off, int size, byte[] dst, int dstOff, int expected,
+                                     short[] decodeTable, byte[] decodeNbBits, int tableLog) {
+        int tableMask = (1 << tableLog) - 1;
         long container = 0;
         int bits = 0;
         int writeIdx = dstOff;
-        int readPos = bitstreamOff;
+        int readPos = off;
         int end = off + size;
 
         while (writeIdx < dstOff + expected && readPos <= end) {
-            // Refill container
             while (bits <= 56 && readPos < end) {
                 container |= (long)(src[readPos++] & 0xFF) << bits;
                 bits += 8;
             }
             if (bits <= 0) break;
 
-            int entry = decodeTable[(int)(container & (MAX_TABLE_SIZE - 1))] & 0xFFFF;
+            int entry = decodeTable[(int)(container & tableMask)] & 0xFFFF;
             int sym = entry & 0xFF;
             int nbBits = (entry >> 8) & 0xFF;
             if (nbBits <= 0 || nbBits > bits) break;
@@ -294,7 +381,6 @@ public final class Huff {
             container >>>= nbBits;
             bits -= nbBits;
         }
-
         return writeIdx - dstOff;
     }
 

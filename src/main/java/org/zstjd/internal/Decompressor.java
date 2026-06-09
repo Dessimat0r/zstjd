@@ -8,13 +8,16 @@ public final class Decompressor {
     private FseTable llTable, ofTable, mlTable;
     private long[] prevOff = {1, 4, 8};
     private byte[] literalsBuf = new byte[Constants.BLOCK_SIZE_MAX];
+    private short[] huffDecodeTable = new short[1 << 12];
+    private byte[] huffDecodeNbBits = new byte[1 << 12];
+    private int huffTableLog;
 
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
     private static final int[] ML_DIST = {1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1};
 
     public Decompressor() { dst = new byte[4096]; }
-    public void reset() { dstPos = 0; prevOff = new long[]{1, 4, 8}; llTable = null; ofTable = null; mlTable = null; }
+    public void reset() { dstPos = 0; prevOff = new long[]{1, 4, 8}; llTable = null; ofTable = null; mlTable = null; huffTableLog = 0; }
 
     public byte[] decompress(byte[] src) { return decompress(src, 0, src.length); }
 
@@ -92,8 +95,7 @@ public final class Decompressor {
                 byte v = src[pos++];
                 Arrays.fill(literals, 0, litLen, v);
             }
-        } else if (litBlockType == 2) { // Compressed literals (Huffman)
-            // byte0: [sizeFormat(2)][compSizeHigh(2)][regenSizeHigh(2)][type=10(2)]
+        } else if (litBlockType == 2 || litBlockType == 3) { // Compressed or Treeless literals (Huffman)
             int regenSize, compSize;
             if (sizeEnc == 0 || sizeEnc == 1) { // 3-byte header
                 regenSize = ((h >> 2) & 3) << 8 | (src[pos + 1] & 0xFF);
@@ -110,12 +112,35 @@ public final class Decompressor {
             }
             if (regenSize > literalsBuf.length) literalsBuf = new byte[regenSize];
             literals = literalsBuf;
-            int decoded = Huff.decompress(src, pos, compSize, literals, 0, regenSize);
+            int decoded;
+            if (litBlockType == 2) {
+                int[] huffCodeLen = new int[256];
+                int hdrSize = Huff.readHuffHeader(src, pos, compSize, huffCodeLen);
+                if (hdrSize <= 0) return size;
+                int bitOff = pos + hdrSize;
+                int bitSize = compSize - hdrSize;
+                huffTableLog = Huff.buildTable(huffCodeLen, huffDecodeTable, huffDecodeNbBits);
+                if ((1 << huffTableLog) > huffDecodeTable.length) { huffDecodeTable = new short[1 << huffTableLog]; huffDecodeNbBits = new byte[1 << huffTableLog]; huffTableLog = Huff.buildTable(huffCodeLen, huffDecodeTable, huffDecodeNbBits); }
+                if (sizeEnc == 0) {
+                    decoded = Huff.decodeStream(src, bitOff, bitSize, literals, 0, regenSize, huffDecodeTable, huffDecodeNbBits, huffTableLog);
+                } else {
+                    decoded = Huff.decodeStream4(src, bitOff, bitSize, literals, 0, regenSize, huffDecodeTable, huffDecodeNbBits, huffTableLog);
+                }
+            } else {
+                if (huffTableLog <= 0) return size;
+                int bitOff = pos;
+                int bitSize = compSize;
+                if (sizeEnc == 0) {
+                    decoded = Huff.decodeStream(src, bitOff, bitSize, literals, 0, regenSize, huffDecodeTable, huffDecodeNbBits, huffTableLog);
+                } else {
+                    decoded = Huff.decodeStream4(src, bitOff, bitSize, literals, 0, regenSize, huffDecodeTable, huffDecodeNbBits, huffTableLog);
+                }
+            }
             if (decoded != regenSize) return size;
             litLen = regenSize;
             pos += compSize;
         } else {
-            return size; // skip unsupported treeless literals
+            return size;
         }
 
         if (pos - start >= size) return size;

@@ -11,6 +11,7 @@ public final class Compressor {
     private byte[] litCodes, ofCodes, ofExtra, mlCodes;
     private long[] prevOff = {1, 4, 8};
     private boolean[] entropySeen = new boolean[256];
+    private int[] huffCodeLen; // last Huffman tree for treeless reuse
 
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
@@ -23,7 +24,7 @@ public final class Compressor {
     private static final int MIN_MATCH_LEN = 8;
 
     public Compressor(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; }
-    public void reset(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; }
+    public void reset(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; huffCodeLen = null; }
 
     public byte[] compress(byte[] src) {
         long maxOut = Constants.compressBound(src.length);
@@ -110,7 +111,6 @@ public final class Compressor {
         prevOff[0] = 1; prevOff[1] = 4; prevOff[2] = 8;
 
         int pos = 0, lastPos = 0;
-        int pendingLit = -1;
         while (pos <= size - MIN_MATCH_LEN) {
             int h = hash4(src, base + pos) & (HASH_SIZE - 1);
             int match = hashTable[h];
@@ -118,7 +118,7 @@ public final class Compressor {
             if (match >= 0 && pos - match <= MAX_OFFSET) {
                 int len = matchLen(src, base + match, base + pos, Math.min(size - pos, 131072));
                 if (len >= MIN_MATCH_LEN) {
-                    // Lazy match: check if next position yields a longer match
+                    // Lazy match: check if next position yields longer match
                     if (pos + 1 <= size - MIN_MATCH_LEN) {
                         int nextH = hash4(src, base + pos + 1) & (HASH_SIZE - 1);
                         int nextMatch = hashTable[nextH];
@@ -163,7 +163,6 @@ public final class Compressor {
             }
             pos++;
         }
-
         int trailing = size - lastPos;
         if (seqCount == 0) return 0;
         totalLits += trailing;
@@ -176,14 +175,22 @@ public final class Compressor {
         if (totalLits > 8) {
             int scratchPos = dstPos + 8;
             ensure(scratchPos + totalLits + 16);
-            int cSize = Huff.compress(src, base, totalLits, dst, scratchPos);
+            // Check if we can reuse previous Huffman tree (treeless)
+            int[] curCodeLen = Huff.computeCodeLengths2(src, base, totalLits, 11);
+            boolean treeless = huffCodeLen != null && curCodeLen != null && arraysEqual(huffCodeLen, curCodeLen, 256);
+            if (!treeless && curCodeLen != null) huffCodeLen = curCodeLen;
+            int cSize;
+            if (treeless) {
+                cSize = Huff.compressTreeless(src, base, totalLits, dst, scratchPos);
+            } else {
+                cSize = Huff.compress(src, base, totalLits, dst, scratchPos);
+            }
             if (cSize > 0 && cSize < totalLits) {
                 int regen = totalLits;
-                // Header: 3 bytes, Size_Format=00 (single stream)
-                // byte0: [00][compSize[9:8]][regen[9:8]][type=10]
-                // byte1: [compSize[7:0]]
-                // byte2: [regen[7:0]]
-                dst[dstPos] = (byte)(((cSize >> 8) & 3) << 4 | ((regen >> 8) & 3) << 2 | 2);
+                int litType = treeless ? 3 : 2;
+                boolean use4 = totalLits > 1024;
+                int szEnc = use4 ? 1 : 0; // 01 = 4 streams 3-byte header, 00 = single stream
+                dst[dstPos] = (byte)((szEnc << 6) | ((cSize >> 8) & 3) << 4 | ((regen >> 8) & 3) << 2 | litType);
                 dst[dstPos + 1] = (byte)cSize;
                 dst[dstPos + 2] = (byte)regen;
                 System.arraycopy(dst, scratchPos, dst, dstPos + 3, cSize);
@@ -281,8 +288,8 @@ public final class Compressor {
     }
 
     private static int hash4(byte[] d, int p) {
-        int h = (d[p]&0xFF)|((d[p+1]&0xFF)<<8)|((d[p+2]&0xFF)<<16);
-        h ^= h >>> 15; h *= 0x85EBCA6B; h ^= h >>> 13; return h;
+        int h = (d[p]&0xFF)|((d[p+1]&0xFF)<<8)|((d[p+2]&0xFF)<<16)|((d[p+3]&0xFF)<<24);
+        return (h * 0x9E3779B9) >>> (32 - HASH_LOG);
     }
     private static int offsetCode(int off) {
         if (off <= 0) return 0;
@@ -291,4 +298,7 @@ public final class Compressor {
     }
     private static int matchLenCode(int len) { for (int i = Constants.MATCHLEN_BASE.length - 1; i >= 0; i--) if (Constants.MATCHLEN_BASE[i] <= len) return i; return 0; }
     private static byte litLenCode(int len) { for (int i = Constants.LITLEN_BASE.length - 1; i >= 0; i--) if (Constants.LITLEN_BASE[i] <= len) return (byte)i; return 0; }
+    private static boolean arraysEqual(int[] a, int[] b, int n) {
+        for (int i = 0; i < n; i++) if (a[i] != b[i]) return false; return true;
+    }
 }
