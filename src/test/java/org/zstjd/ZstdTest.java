@@ -102,15 +102,22 @@ class ZstdTest {
         assertTrue(Zstd.maxLevel() > 0);
     }
 
-    @Test @Order(10)
+    @Test @Order(11)
     void getDecompressedSize() {
         byte[] d = "Test content size detection for zstjd.".repeat(5).getBytes();
+        // Without content size flag: should return -1
         byte[] c = Zstd.compress(d);
-        int size = Zstd.getDecompressedSize(c);
-        assertTrue(size == d.length || size < 0);
+        assertEquals(-1, Zstd.getDecompressedSize(c));
+        // With content size flag: should return actual size
+        byte[] c2 = Zstd.compress(d, Zstd.defaultLevel(), true);
+        int size = Zstd.getDecompressedSize(c2);
+        assertEquals(d.length, size);
+        // Both should decompress correctly
+        assertArrayEquals(d, Zstd.decompress(c));
+        assertArrayEquals(d, Zstd.decompress(c2));
     }
 
-    @Test @Order(11)
+    @Test @Order(12)
     void multiThreaded() throws Exception {
         byte[] data = "Multi-threaded zstjd compression test. ".repeat(50).getBytes();
         int threads = 8, iters = 100;
@@ -133,7 +140,7 @@ class ZstdTest {
         assertEquals(0, errors.get(), "Thread safety errors");
     }
 
-    @Test @Order(12)
+    @Test @Order(25)
     void repeatedReuse() {
         byte[] d = "Reuse test data for ThreadLocal context verification.".getBytes();
         for (int i = 0; i < 1000; i++) {
@@ -212,6 +219,21 @@ class ZstdTest {
     }
 
     @Test @Order(19)
+    void skippableFrames() {
+        // Build a skippable frame manually: magic 0x184D2A50, size 4, 4 bytes data
+        byte[] skipFrame = new byte[12];
+        skipFrame[0] = (byte)0x50; skipFrame[1] = (byte)0x2A; skipFrame[2] = (byte)0x4D; skipFrame[3] = (byte)0x18;
+        skipFrame[4] = 4; skipFrame[5] = 0; skipFrame[6] = 0; skipFrame[7] = 0; // LE32 size = 4
+        skipFrame[8] = 0x01; skipFrame[9] = 0x02; skipFrame[10] = 0x03; skipFrame[11] = 0x04;
+        byte[] d = "Skippable test".getBytes();
+        byte[] ourFrame = Zstd.compress(d);
+        byte[] combined = Arrays.copyOf(skipFrame, skipFrame.length + ourFrame.length);
+        System.arraycopy(ourFrame, 0, combined, skipFrame.length, ourFrame.length);
+        byte[] r = Zstd.decompress(combined);
+        assertArrayEquals(d, r);
+    }
+
+    @Test @Order(24)
     void badMagic() {
         byte[] garbage = new byte[]{0x00, 0x00, 0x00, 0x00, 0x00};
         byte[] r = Zstd.decompress(garbage);
@@ -247,11 +269,10 @@ class ZstdTest {
 
     @Test @Order(23)
     void getContentSizeKnown() throws Exception {
-        // Our frames don't store content size, so getDecompressedSize returns -1
         byte[] d = "Test getDecompressedSize with known content. ".repeat(5).getBytes();
-        byte[] c = Zstd.compress(d);
-        assertEquals(-1, Zstd.getDecompressedSize(c), "Our frames have no content size");
-        // Decompression still works
+        // With content size flag
+        byte[] c = Zstd.compress(d, Zstd.defaultLevel(), true);
+        assertEquals(d.length, Zstd.getDecompressedSize(c));
         assertArrayEquals(d, Zstd.decompress(c));
     }
 }

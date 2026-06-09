@@ -13,6 +13,7 @@ public final class Compressor {
     private long[] prevOff = {1, 4, 8};
     private boolean[] entropySeen = new boolean[256];
     private int[] huffCodeLen; // last Huffman tree for treeless reuse
+    private Dict dict; // active dictionary (null if none)
 
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
@@ -21,25 +22,59 @@ public final class Compressor {
     private static final FseEncoder OF_TABLE = new FseEncoder(FseTable.fromDist(OF_DIST, 5, 28));
     private static final FseEncoder ML_TABLE = new FseEncoder(FseTable.fromDist(ML_DIST, 6, 52));
 
-    private static final int HASH_LOG = 14, HASH_SIZE = 1 << HASH_LOG, MIN_MATCH = 4, MAX_OFFSET = 1 << 18;
+    private static final int HASH_LOG = 14, HASH_SIZE = 1 << HASH_LOG, MIN_MATCH = 4, MAX_OFFSET = 1 << 22;
     private static final int MIN_MATCH_LEN = 8;
     private static final int MAX_CHAIN = 64;
 
     public Compressor(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; }
     public void reset(int level) { this.level = level; prevOff = new long[]{1, 4, 8}; huffCodeLen = null; }
 
-    public byte[] compress(byte[] src) {
+    public byte[] compress(byte[] src) { return compress(src, false, null); }
+    public byte[] compress(byte[] src, Dict dict) { return compress(src, false, dict); }
+    public byte[] compress(byte[] src, boolean withContentSize) { return compress(src, withContentSize, null); }
+
+    public byte[] compress(byte[] src, boolean withContentSize, Dict dict) {
+        this.dict = dict;
         long maxOut = Constants.compressBound(src.length);
         if (maxOut <= 0) maxOut = src.length + 64;
         dst = new byte[(int) Math.min(maxOut, Integer.MAX_VALUE - 8)];
         dstPos = 0;
         Constants.writeLE32(dst, dstPos, Constants.ZSTD_MAGIC); dstPos += 4;
 
-        // Frame header: always singleSegment=0, no content size, checksum enabled
-        // Matches the reference CLI's conservative header format for best compatibility
-        dst[dstPos++] = (byte)(1 << 2); // FHD = 0x04: checksum, no content size, multi-segment
+        // Frame header: checksum enabled, multi-segment, optional content size
+        // For content size: use singleSegment=1 for <=255 (1-byte size, CLI compatible),
+        // or fcsId=2 (4 bytes) for larger. Avoid fcsId=1 (macOS CLI compat issue).
+        int fcsId = 0;
+        boolean singleSeg = false;
+        if (withContentSize) {
+            if (src.length <= 255) {
+                singleSeg = true; fcsId = 0; // 1-byte content size via singleSegment
+            } else {
+                fcsId = 2; // 4 bytes
+            }
+        }
+        int dictIdField = 0;
+        if (dict != null) dictIdField = (dict.id <= 255) ? 1 : ((dict.id <= 65535) ? 2 : 3);
+        dst[dstPos++] = (byte)((fcsId << 6) | (singleSeg ? (1 << 5) : 0) | (1 << 2) | dictIdField);
         int wl = Math.max(17 + Math.min(8, level / 3), Constants.WINDOW_LOG_MIN);
-        dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
+        if (dict != null) wl = Math.max(wl, 20); // larger window for dict matches
+        if (!singleSeg) {
+            dst[dstPos++] = (byte)(((wl - Constants.WINDOW_LOG_MIN) & 0x1F) << 3);
+        }
+
+        if (withContentSize) {
+            long srcLen = src.length;
+            if (singleSeg) {
+                dst[dstPos++] = (byte)srcLen;
+            } else {
+                Constants.writeLE32(dst, dstPos, (int)srcLen); dstPos += 4;
+            }
+        }
+        if (dict != null) {
+            if (dictIdField == 1) dst[dstPos++] = (byte)dict.id;
+            else if (dictIdField == 2) { Constants.writeLE16(dst, dstPos, dict.id); dstPos += 2; }
+            else { Constants.writeLE32(dst, dstPos, dict.id); dstPos += 4; }
+        }
 
         writeBlocks(src);
         // Content checksum (XXH64 truncated to 4 bytes)
@@ -68,7 +103,7 @@ public final class Compressor {
             }
 
             int dataStart = dstPos;
-            int compSize = tryLz77(src, srcPos, chunk);
+            int compSize = tryLz77(src, srcPos, chunk, dict);
             if (compSize > 0 && compSize < chunk * 8 / 10) {
                 Constants.writeLE24(dst, hdrPos, (last ? 1 : 0) | (Constants.BLOCK_COMPRESSED << 1) | (compSize << 3));
                 dstPos = dataStart + compSize;
@@ -97,8 +132,23 @@ public final class Compressor {
         }
     }
 
-    private int tryLz77(byte[] src, int base, int size) {
+    private int tryLz77(byte[] src, int base, int size) { return tryLz77(src, base, size, null); }
+
+    private int tryLz77(byte[] src, int base, int size, Dict dict) {
         if (size < 32) return 0;
+
+        // Build combined buffer if dictionary is present
+        byte[] matchBuf = src;
+        int matchBase = base;
+        int dictSize = (dict != null && dict.content != null) ? dict.content.length : 0;
+        byte[] combined = null;
+        if (dictSize > 0) {
+            combined = new byte[dictSize + size];
+            System.arraycopy(dict.content, 0, combined, 0, dictSize);
+            System.arraycopy(src, base, combined, dictSize, size);
+            matchBuf = combined;
+            matchBase = 0;
+        }
         // Quick entropy check: if too many unique bytes in first 64 bytes, skip
         int check = Math.min(size, 64);
         int unique = 0;
@@ -123,21 +173,28 @@ public final class Compressor {
 
         int seqCount = 0, totalLits = 0;
         prevOff[0] = 1; prevOff[1] = 4; prevOff[2] = 8;
+        // Hash the dictionary content first so matches can reference it
+        if (dictSize > 0) {
+            prevOff[0] = dictSize; prevOff[1] = dictSize; prevOff[2] = dictSize;
+            int dictHashEnd = Math.max(0, dictSize - MIN_MATCH_LEN + 1);
+            for (int dp = 0; dp < dictHashEnd; dp++) {
+                int h = hash4(matchBuf, matchBase + dp) & (HASH_SIZE - 1);
+                hashTable[h] = -(dp + 1); // negative => dict position encoded as -(dp+1)
+            }
+        }
 
         // Build hash chain
         if (chainNext.length < size) chainNext = new int[size + 1];
         int[] cost = new int[size + 1];
-        int[] prevPos = new int[size + 1];  // previous position in optimal path
-        int[] matchLenAt = new int[size + 1];  // match length (-1 = literal)
+        int[] prevPos = new int[size + 1];
+        int[] matchLenAt = new int[size + 1];
         int[] matchOffAt = new int[size + 1];
-        // Initialize
         cost[0] = 0;
         for (int i = 1; i <= size; i++) cost[i] = Integer.MAX_VALUE;
 
         for (int p = 0; p < size; p++) {
             if (cost[p] == Integer.MAX_VALUE) continue;
 
-            // Option 1: literal byte
             int litCost = cost[p] + 8;
             if (litCost < cost[p + 1]) {
                 cost[p + 1] = litCost;
@@ -145,25 +202,30 @@ public final class Compressor {
                 matchLenAt[p + 1] = -1;
             }
 
-            // Option 2: match at current position (if available)
-            // Must get hash / save old head BEFORE updating the chain
             int matchH = -1;
-            int matchOff = 0;
             if (p <= size - MIN_MATCH_LEN) {
-                int h = hash4(src, base + p) & (HASH_SIZE - 1);
-                matchH = hashTable[h];  // save old head before updating
-                // Update hash chain
+                int bufPos = dictSize + p;
+                int h = hash4(matchBuf, matchBase + bufPos) & (HASH_SIZE - 1);
+                matchH = hashTable[h];
                 if (p <= size - MIN_MATCH_LEN - 3) {
-                    chainNext[p] = matchH;
+                    chainNext[p] = (matchH >= 0) ? matchH : -1; // don't chain negative (dict) entries
                     hashTable[h] = p;
                 }
-                if (matchH >= 0 && p - matchH <= MAX_OFFSET) {
-                    int len = matchLen(src, base + matchH, base + p, Math.min(size - p, 131072));
+                // matchH: positive = source-relative, negative = dict position (-dp-1)
+                int combinedMatchPos, off;
+                if (matchH >= 0) {
+                    combinedMatchPos = dictSize + matchH;
+                } else {
+                    combinedMatchPos = -matchH - 1; // dp = -matchH - 1, position in dict
+                }
+                if (matchH >= 0 && bufPos - combinedMatchPos <= MAX_OFFSET) {
+                    int len = matchLen(matchBuf, combinedMatchPos, bufPos, Math.min(size + dictSize - bufPos, 131072));
                     if (len >= MIN_MATCH_LEN) {
                         int end = p + len;
                         if (end > size) end = size;
+                        off = bufPos - combinedMatchPos;
                         int mlCode = matchLenCode(len);
-                        int ofCode = offsetCode(p - matchH);
+                        int ofCode = offsetCode(off);
                         int mLBits = Constants.MATCHLEN_BITS[mlCode];
                         int oBits = Constants.OFFSET_BITS[ofCode];
                         int estCost = cost[p] + 16 + mLBits + oBits;

@@ -2,6 +2,7 @@ package org.zstjd;
 
 import org.zstjd.internal.Compressor;
 import org.zstjd.internal.Decompressor;
+import org.zstjd.internal.Dict;
 import org.zstjd.internal.Constants;
 import java.util.Arrays;
 import java.util.concurrent.*;
@@ -19,6 +20,12 @@ public class Zstd {
         Compressor c = TL_COMP.get();
         c.reset(level);
         return c.compress(data);
+    }
+
+    public static byte[] compress(byte[] data, int level, boolean withContentSize) {
+        Compressor c = TL_COMP.get();
+        c.reset(level);
+        return c.compress(data, withContentSize);
     }
 
     public static byte[] compress(byte[] data, int level, int workers) {
@@ -57,9 +64,28 @@ public class Zstd {
         return out;
     }
 
+    public static byte[] compress(byte[] data, int level, Dict dict) {
+        Compressor c = TL_COMP.get();
+        c.reset(level);
+        return c.compress(data, dict);
+    }
+
+    public static byte[] compress(byte[] data, int level, boolean withContentSize, Dict dict) {
+        Compressor c = TL_COMP.get();
+        c.reset(level);
+        return c.compress(data, withContentSize, dict);
+    }
+
     public static byte[] decompress(byte[] data) {
         Decompressor d = TL_DECOMP.get();
         d.reset();
+        return d.decompress(data);
+    }
+
+    public static byte[] decompress(byte[] data, Dict dict) {
+        Decompressor d = TL_DECOMP.get();
+        d.reset();
+        d.useDict(dict);
         return d.decompress(data);
     }
 

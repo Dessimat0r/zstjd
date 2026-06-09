@@ -11,6 +11,9 @@ public final class Decompressor {
     private short[] huffDecodeTable = new short[1 << 12];
     private byte[] huffDecodeNbBits = new byte[1 << 12];
     private int huffTableLog;
+    private Dict dict;
+
+    public void useDict(Dict d) { this.dict = d; }
 
     private static final int[] LL_DIST = {4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
     private static final int[] OF_DIST = {1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
@@ -26,6 +29,13 @@ public final class Decompressor {
         int pos = off, end = off + len;
         while (pos + 4 <= end) {
             int magic = Constants.readLE32(src, pos);
+            // Skippable frames: magic in range 0x184D2A50-0x184D2A5F
+            if ((magic & 0xFFFFFFF0) == 0x184D2A50) {
+                if (pos + 8 > end) break;
+                int skipSize = Constants.readLE32(src, pos + 4);
+                pos += 8 + skipSize;
+                continue;
+            }
             if (magic != Constants.ZSTD_MAGIC) break;
             pos += 4;
             boolean hasChecksum = ((src[pos] >> 2) & 1) != 0;
@@ -68,8 +78,14 @@ public final class Decompressor {
         else if (fcsId == 1) pos += 2;
         else if (fcsId == 2) pos += 4;
         else if (fcsId == 3) pos += 8;
-        int dict = fhd & 3;
-        if (dict > 0) pos += 1 << dict;
+        int dictFlag = fhd & 3;
+        if (dictFlag > 0) {
+            int dictIdLen = 1 << (dictFlag - 1); // 1, 2, or 4 bytes
+            if (dictFlag == 3) dictIdLen = 4;
+            // We don't validate the dict ID against our loaded dict here;
+            // the caller is responsible for providing the correct dict.
+            pos += dictIdLen;
+        }
         return pos;
     }
 
@@ -136,7 +152,16 @@ public final class Decompressor {
                     decoded = Huff.decodeStream4(src, bitOff, bitSize, literals, 0, regenSize, huffDecodeTable, huffDecodeNbBits, huffTableLog);
                 }
             } else {
-                if (huffTableLog <= 0) return size;
+                // Treeless (type 3) or repeat — use previous or dict table
+                if (huffTableLog <= 0) {
+                    if (dict != null) {
+                        huffDecodeTable = dict.huffTable;
+                        huffDecodeNbBits = dict.huffNbBits;
+                        huffTableLog = dict.huffTableLog;
+                    } else {
+                        return size;
+                    }
+                }
                 int bitOff = pos;
                 int bitSize = compSize;
                 if (sizeEnc == 0) {
@@ -171,9 +196,9 @@ public final class Decompressor {
 
         int frStart = pos + consumed;
         ForwardReader fr = new ForwardReader(src, frStart);
-        llTable = readSeqTable(fr, llM, llTable, LL_DIST, 6, 35);
-        ofTable = readSeqTable(fr, ofM, ofTable, OF_DIST, 5, 28);
-        mlTable = readSeqTable(fr, mlM, mlTable, ML_DIST, 6, 52);
+        llTable = readSeqTable(fr, llM, llTable, LL_DIST, 6, 35, 0);
+        ofTable = readSeqTable(fr, ofM, ofTable, OF_DIST, 5, 28, 1);
+        mlTable = readSeqTable(fr, mlM, mlTable, ML_DIST, 6, 52, 2);
         int frEnd = fr.bytePos(); fr.align();
         consumed += frEnd - frStart;
 
@@ -214,12 +239,32 @@ public final class Decompressor {
                 litIdx += litLen;
             }
 
-            if (matchLen > 0 && offset > 0 && offset <= dstPos) {
-                int sOff = dstPos - offset;
-                grow(dstPos + matchLen);
-                if (offset >= matchLen) System.arraycopy(dst, sOff, dst, dstPos, matchLen);
-                else for (int j = 0; j < matchLen; j++) dst[dstPos + j] = dst[sOff + j];
-                dstPos += matchLen;
+            if (matchLen > 0 && offset > 0) {
+                if (offset <= dstPos) {
+                    // Normal match within decoded output
+                    int sOff = dstPos - offset;
+                    grow(dstPos + matchLen);
+                    if (offset >= matchLen) System.arraycopy(dst, sOff, dst, dstPos, matchLen);
+                    else for (int j = 0; j < matchLen; j++) dst[dstPos + j] = dst[sOff + j];
+                    dstPos += matchLen;
+                } else if (dict != null && offset <= dstPos + dict.content.length) {
+                    // Match references dictionary content
+                    int dictOff = dict.content.length - (offset - dstPos);
+                    int fromDict = Math.min(matchLen, dict.content.length - dictOff);
+                    if (fromDict > 0) {
+                        grow(dstPos + matchLen);
+                        System.arraycopy(dict.content, dictOff, dst, dstPos, fromDict);
+                        dstPos += fromDict;
+                    }
+                    // If match extends beyond dict content, fill from newly decoded bytes
+                    int remaining = matchLen - fromDict;
+                    if (remaining > 0 && offset <= dstPos) {
+                        int sOff = dstPos - offset;
+                        for (int j = 0; j < remaining; j++)
+                            dst[dstPos + j] = dst[sOff + j];
+                        dstPos += remaining;
+                    }
+                }
             }
 
             if (i < seqCount - 1) {
@@ -245,11 +290,18 @@ public final class Decompressor {
         return consumed + streamSize;
     }
 
-    private FseTable readSeqTable(ForwardReader fr, int mode, FseTable prev, int[] dist, int acc, int max) {
+    private FseTable readSeqTable(ForwardReader fr, int mode, FseTable prev, int[] dist, int acc, int max, int tableType) {
         if (mode == 0) return FseTable.fromDist(dist, acc, max);
         if (mode == 1) { int s = fr.read(8); return FseTable.fromDist(new int[]{-1}, 1, 0); }
         if (mode == 2) return FseTable.readFrom(fr, max);
-        if (prev != null) return prev;
+        if (mode == 3) {
+            if (prev != null) return prev;
+            if (dict != null) {
+                if (tableType == 0) return dict.llTable;
+                if (tableType == 1) return dict.ofTable;
+                return dict.mlTable;
+            }
+        }
         return FseTable.fromDist(dist, acc, max);
     }
 
