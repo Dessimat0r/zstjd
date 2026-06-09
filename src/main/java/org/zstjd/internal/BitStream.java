@@ -19,12 +19,6 @@ public final class BitStream {
         bits += n;
     }
 
-    public void writeBitsMsb(int value, int n) {
-        int rev = Integer.reverse(value) >>> (32 - n);
-        container |= (long) (rev & ((1L << n) - 1)) << bits;
-        bits += n;
-    }
-
     public void flush() {
         while (bits >= 8) {
             data[pos++] = (byte) container;
@@ -44,7 +38,4 @@ public final class BitStream {
         return pos - start;
     }
 
-    public int position() {
-        return pos + (bits > 0 ? 1 : 0);
-    }
 }

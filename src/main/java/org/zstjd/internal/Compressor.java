@@ -172,7 +172,7 @@ public final class Compressor {
             stream.flush();
         }
 
-        // Write initial states (each finish flushes, matching reference layout)
+        // Write initial states (each finish flushes)
         ML_TABLE.finish(stream, mlState);
         OF_TABLE.finish(stream, ofState);
         LL_TABLE.finish(stream, llState);

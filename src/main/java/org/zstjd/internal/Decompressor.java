@@ -118,17 +118,17 @@ public final class Decompressor {
 
         int streamSize = max - consumed;
         if (streamSize <= 0) return max;
-        int lastByte = src[pos + consumed + streamSize - 1] & 0xFF;
-        int padding = lastByte == 0 ? 8 : 8 - (31 - Integer.numberOfLeadingZeros(lastByte));
-        long bitOff = streamSize * 8L - padding;
-        int base = pos + consumed;
 
-        bitOff -= llTable.accuracyLog; int llSt = (int)readBits(src, base, bitOff, llTable.accuracyLog);
-        bitOff -= ofTable.accuracyLog; int ofSt = (int)readBits(src, base, bitOff, ofTable.accuracyLog);
-        bitOff -= mlTable.accuracyLog; int mlSt = (int)readBits(src, base, bitOff, mlTable.accuracyLog);
+        // Initialize container-based reader (matches reference BIT_DStream_t)
+        BitReader reader = new BitReader();
+        reader.init(src, pos + consumed, streamSize);
+
+        int llSt = reader.readBits(llTable.accuracyLog);
+        int ofSt = reader.readBits(ofTable.accuracyLog);
+        int mlSt = reader.readBits(mlTable.accuracyLog);
 
         int litIdx = 0;
-        for (int i = 0; i < seqCount && bitOff >= 0; i++) {
+        for (int i = 0; i < seqCount; i++) {
             int llCode = llTable.symbol[llSt] & 0xFFFF;
             int ofCode = ofTable.symbol[ofSt] & 0xFFFF;
             int mlCode = mlTable.symbol[mlSt] & 0xFFFF;
@@ -137,16 +137,15 @@ public final class Decompressor {
             int mlBits = Constants.MATCHLEN_BITS[Math.min(mlCode, 52)];
             int llBits = Constants.LITLEN_BITS[Math.min(llCode, 35)];
 
-            bitOff -= ofBits; long ofVal = readBits(src, base, bitOff, ofBits);
-            bitOff -= mlBits; long mlVal = readBits(src, base, bitOff, mlBits);
-            bitOff -= llBits; long llVal = readBits(src, base, bitOff, llBits);
+            long ofVal = reader.readBits(ofBits);
+            long mlVal = reader.readBits(mlBits);
+            long llVal = reader.readBits(llBits);
 
             int litLen = Constants.LITLEN_BASE[llCode] + (int)llVal;
             int matchLen = Constants.MATCHLEN_BASE[mlCode] + (int)mlVal;
             int offset = Constants.OFFSET_BASE[ofCode] + (int)ofVal;
             offset = resolveOffset(offset, litLen, i);
 
-            // Copy literals
             if (litLen > 0 && litIdx + litLen <= litTotal) {
                 grow(dstPos + litLen);
                 System.arraycopy(literals, litIdx, dst, dstPos, litLen);
@@ -154,7 +153,6 @@ public final class Decompressor {
                 litIdx += litLen;
             }
 
-            // Copy match
             if (matchLen > 0 && offset <= dstPos) {
                 int sOff = dstPos - offset;
                 grow(dstPos + matchLen);
@@ -165,15 +163,15 @@ public final class Decompressor {
 
             if (i < seqCount - 1) {
                 int llNb = llTable.numBits[llSt] & 0xFF;
-                bitOff -= llNb; long llNext = readBits(src, base, bitOff, llNb);
+                long llNext = reader.readBits(llNb);
                 llSt = (llTable.newState[llSt] & 0xFFFF) + (int)llNext;
 
                 int mlNb = mlTable.numBits[mlSt] & 0xFF;
-                bitOff -= mlNb; long mlNext = readBits(src, base, bitOff, mlNb);
+                long mlNext = reader.readBits(mlNb);
                 mlSt = (mlTable.newState[mlSt] & 0xFFFF) + (int)mlNext;
 
                 int ofNb = ofTable.numBits[ofSt] & 0xFF;
-                bitOff -= ofNb; long ofNext = readBits(src, base, bitOff, ofNb);
+                long ofNext = reader.readBits(ofNb);
                 ofSt = (ofTable.newState[ofSt] & 0xFFFF) + (int)ofNext;
             }
         }
@@ -201,19 +199,6 @@ public final class Decompressor {
         long v = offset - 3;
         prevOff[2] = prevOff[1]; prevOff[1] = prevOff[0]; prevOff[0] = v;
         return (int)v;
-    }
-
-    private long readBits(byte[] src, int base, long bitOff, int n) {
-        if (n <= 0) return 0;
-        long val = 0;
-        for (int i = 0; i < n; i++) {
-            long p = bitOff + i;
-            if (p < 0) { continue; }
-            int bi = (int)(p / 8);
-            if (bi >= src.length - base) { continue; }
-            val |= (long)(((src[base + bi] >> ((int)(p % 8))) & 1)) << i;
-        }
-        return val;
     }
 
     public static int getContentSize(byte[] data) {

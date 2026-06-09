@@ -1,33 +1,46 @@
 package org.zstjd.internal;
 
-/** Backward bitstream reader (read from end of buffer, MSB of each byte first). */
+/** Container-based backward bitstream reader matching reference's BIT_DStream_t. */
 public final class BitReader {
-    private final byte[] data;
-    private final int base;
-    public long bits;
-    public int bitsLeft;
+    private long container;
+    private int bitsConsumed;
+    private int streamSize;
 
-    public BitReader(byte[] data, int base) {
-        this.data = data;
-        this.base = base;
-    }
+    public void init(byte[] src, int off, int len) {
+        streamSize = len;
+        if (len < 1) throw new IllegalArgumentException("Empty bitstream");
 
-    public void load(long bitOffset, int n) {
-        bits = 0;
-        bitsLeft = n;
-        for (int i = 0; i < n; i++) {
-            long p = bitOffset + i;
-            if (p < 0) { bits = (bits << 1); continue; }
-            int bi = (int)(p / 8);
-            if (bi >= data.length - base) { bits = (bits << 1); continue; }
-            bits = (bits << 1) | ((data[base + bi] >> ((int)(p % 8))) & 1);
+        if (len >= 8) {
+            // Load last 8 bytes as little-endian (MEM_readLEST)
+            container = (long)(src[off + len - 8] & 0xFF)
+                     | ((long)(src[off + len - 7] & 0xFF) << 8)
+                     | ((long)(src[off + len - 6] & 0xFF) << 16)
+                     | ((long)(src[off + len - 5] & 0xFF) << 24)
+                     | ((long)(src[off + len - 4] & 0xFF) << 32)
+                     | ((long)(src[off + len - 3] & 0xFF) << 40)
+                     | ((long)(src[off + len - 2] & 0xFF) << 48)
+                     | ((long)(src[off + len - 1] & 0xFF) << 56);
+        } else {
+            container = 0;
+            for (int i = 0; i < len; i++) {
+                container |= (long)(src[off + i] & 0xFF) << (i * 8);
+            }
+        }
+
+        int lastByte = src[off + len - 1] & 0xFF;
+        if (lastByte == 0) throw new IllegalArgumentException("No end mark");
+        int hb = 31 - Integer.numberOfLeadingZeros(lastByte);
+        bitsConsumed = 8 - hb;
+
+        if (len < 8) {
+            bitsConsumed += (8 - len) * 8; // account for zero bytes above loaded data
         }
     }
 
-    public int read(int n) {
-        if (n > bitsLeft) throw new IllegalArgumentException("want " + n + " bits, have " + bitsLeft);
-        int val = (int)(bits >> (bitsLeft - n));
-        bitsLeft -= n;
-        return val;
+    public int readBits(int n) {
+        int start = (int)((64 - bitsConsumed - n) & 63);
+        int result = (int)((container >>> start) & ((1L << n) - 1));
+        bitsConsumed += n;
+        return result;
     }
 }
